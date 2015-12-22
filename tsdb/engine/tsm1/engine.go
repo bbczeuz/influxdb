@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,15 +17,23 @@ import (
 )
 
 func init() {
-	tsdb.RegisterEngine("tsm1dev", NewDevEngine)
+	tsdb.RegisterEngine("tsm1", NewDevEngine)
 }
 
 // Ensure Engine implements the interface.
 var _ tsdb.Engine = &DevEngine{}
 
+const (
+	// keyFieldSeparator separates the series key from the field name in the composite key
+	// that identifies a specific field in series
+	keyFieldSeparator = "#!~#"
+)
+
 // Engine represents a storage engine with compressed blocks.
 type DevEngine struct {
-	mu sync.RWMutex
+	mu   sync.RWMutex
+	done chan struct{}
+	wg   sync.WaitGroup
 
 	path   string
 	logger *log.Logger
@@ -35,11 +44,16 @@ type DevEngine struct {
 	CompactionPlan CompactionPlanner
 	FileStore      *FileStore
 
-	RotateFileSize    uint32
-	MaxFileSize       uint32
 	MaxPointsPerBlock int
 
+	// CacheFlushMemorySizeThreshold specifies the minimum size threshodl for
+	// the cache when the engine should write a snapshot to a TSM file
 	CacheFlushMemorySizeThreshold uint64
+
+	// CacheFlushWriteColdDuration specifies the length of time after which if
+	// no writes have been committed to the WAL, the engine will write
+	// a snapshot of the cache to a TSM file
+	CacheFlushWriteColdDuration time.Duration
 }
 
 // NewDevEngine returns a new instance of Engine.
@@ -48,18 +62,18 @@ func NewDevEngine(path string, walPath string, opt tsdb.EngineOptions) tsdb.Engi
 	w.LoggingEnabled = opt.Config.WALLoggingEnabled
 
 	fs := NewFileStore(path)
+	fs.traceLogging = opt.Config.DataLoggingEnabled
 
 	cache := NewCache(uint64(opt.Config.CacheMaxMemorySize))
 
 	c := &Compactor{
-		Dir:         path,
-		MaxFileSize: maxTSMFileSize,
-		FileStore:   fs,
+		Dir:       path,
+		FileStore: fs,
 	}
 
 	e := &DevEngine{
 		path:   path,
-		logger: log.New(os.Stderr, "[tsm1dev] ", log.LstdFlags),
+		logger: log.New(os.Stderr, "[tsm1] ", log.LstdFlags),
 
 		WAL:   w,
 		Cache: cache,
@@ -67,13 +81,14 @@ func NewDevEngine(path string, walPath string, opt tsdb.EngineOptions) tsdb.Engi
 		FileStore: fs,
 		Compactor: c,
 		CompactionPlan: &DefaultPlanner{
-			FileStore: fs,
+			FileStore:                    fs,
+			MinCompactionFileCount:       opt.Config.CompactMinFileCount,
+			CompactFullWriteColdDuration: time.Duration(opt.Config.CompactFullWriteColdDuration),
 		},
-		RotateFileSize:    DefaultRotateFileSize,
-		MaxFileSize:       MaxDataFileSize,
-		MaxPointsPerBlock: DefaultMaxPointsPerBlock,
+		MaxPointsPerBlock: opt.Config.MaxPointsPerBlock,
 
-		CacheFlushMemorySizeThreshold: uint64(opt.Config.WALFlushMemorySizeThreshold),
+		CacheFlushMemorySizeThreshold: opt.Config.CacheSnapshotMemorySize,
+		CacheFlushWriteColdDuration:   time.Duration(opt.Config.CacheSnapshotWriteColdDuration),
 	}
 
 	return e
@@ -88,11 +103,14 @@ func (e *DevEngine) PerformMaintenance() {
 
 // Format returns the format type of this engine
 func (e *DevEngine) Format() tsdb.EngineFormat {
-	return tsdb.TSM1DevFormat
+	return tsdb.TSM1Format
 }
 
 // Open opens and initializes the engine.
 func (e *DevEngine) Open() error {
+	e.done = make(chan struct{})
+	e.Compactor.Cancel = e.done
+
 	if err := os.MkdirAll(e.path, 0777); err != nil {
 		return err
 	}
@@ -113,6 +131,7 @@ func (e *DevEngine) Open() error {
 		return err
 	}
 
+	e.wg.Add(2)
 	go e.compactCache()
 	go e.compactTSM()
 
@@ -121,12 +140,18 @@ func (e *DevEngine) Open() error {
 
 // Close closes the engine.
 func (e *DevEngine) Close() error {
+	// Shutdown goroutines and wait.
+	close(e.done)
+	e.wg.Wait()
+
+	// Lock now and close everything else down.
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	e.WAL.Close()
-
-	return nil
+	if err := e.FileStore.Close(); err != nil {
+		return err
+	}
+	return e.WAL.Close()
 }
 
 // SetLogOutput is a no-op.
@@ -240,19 +265,41 @@ func (e *DevEngine) DeleteSeries(seriesKeys []string) error {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
+	// keyMap is used to see if a given key should be deleted.  seriesKey
+	// are the measurement + tagset (minus separate & field)
 	keyMap := map[string]struct{}{}
 	for _, k := range seriesKeys {
 		keyMap[k] = struct{}{}
 	}
 
+	var deleteKeys []string
+	// go through the keys in the file store
 	for _, k := range e.FileStore.Keys() {
 		seriesKey, _ := seriesAndFieldFromCompositeKey(k)
 		if _, ok := keyMap[seriesKey]; ok {
-			e.FileStore.Delete(k)
+			deleteKeys = append(deleteKeys, k)
+		}
+	}
+	e.FileStore.Delete(deleteKeys)
+
+	// find the keys in the cache and remove them
+	walKeys := make([]string, 0)
+	e.Cache.Lock()
+	defer e.Cache.Unlock()
+
+	s := e.Cache.Store()
+	for k, _ := range s {
+		seriesKey, _ := seriesAndFieldFromCompositeKey(k)
+		if _, ok := keyMap[seriesKey]; ok {
+			walKeys = append(walKeys, k)
+			delete(s, k)
 		}
 	}
 
-	return nil
+	// delete from the WAL
+	_, err := e.WAL.Delete(walKeys)
+
+	return err
 }
 
 // DeleteMeasurement deletes a measurement and all related series.
@@ -329,87 +376,89 @@ func (e *DevEngine) writeSnapshotAndCommit(closedFiles []string, snapshot *Cache
 	return nil
 }
 
+// compactCache continually checks if the WAL cache should be written to disk
 func (e *DevEngine) compactCache() {
+	defer e.wg.Done()
 	for {
-		if e.Cache.Size() > e.CacheFlushMemorySizeThreshold {
-			err := e.WriteSnapshot()
-			if err != nil {
-				e.logger.Printf("error writing snapshot: %v", err)
+		select {
+		case <-e.done:
+			return
+
+		default:
+			if e.ShouldCompactCache(e.WAL.LastWriteTime()) {
+				err := e.WriteSnapshot()
+				if err != nil {
+					e.logger.Printf("error writing snapshot: %v", err)
+				}
 			}
 		}
 		time.Sleep(time.Second)
 	}
 }
 
+// ShouldCompactCache returns true if the Cache is over its flush threshold
+// or if the passed in lastWriteTime is older than the write cold threshold
+func (e *DevEngine) ShouldCompactCache(lastWriteTime time.Time) bool {
+	sz := e.Cache.Size()
+
+	if sz == 0 {
+		return false
+	}
+
+	return sz > e.CacheFlushMemorySizeThreshold ||
+		time.Now().Sub(lastWriteTime) > e.CacheFlushWriteColdDuration
+}
+
 func (e *DevEngine) compactTSM() {
+	defer e.wg.Done()
+
 	for {
-		tsmFiles := e.CompactionPlan.Plan()
+		select {
+		case <-e.done:
+			return
 
-		if len(tsmFiles) == 0 {
-			time.Sleep(time.Second)
-			continue
+		default:
+			tsmFiles := e.CompactionPlan.Plan(e.WAL.LastWriteTime())
+
+			if len(tsmFiles) == 0 {
+				time.Sleep(time.Second)
+				continue
+			}
+
+			start := time.Now()
+			e.logger.Printf("beginning compaction of %d TSM files", len(tsmFiles))
+
+			files, err := e.Compactor.Compact(tsmFiles)
+			if err != nil {
+				e.logger.Printf("error compacting TSM files: %v", err)
+				time.Sleep(time.Second)
+				continue
+			}
+
+			if err := e.FileStore.Replace(tsmFiles, files); err != nil {
+				e.logger.Printf("error replacing new TSM files: %v", err)
+				time.Sleep(time.Second)
+				continue
+			}
+
+			e.logger.Printf("compacted %d TSM into %d files in %s",
+				len(tsmFiles), len(files), time.Since(start))
 		}
-
-		start := time.Now()
-		e.logger.Printf("compacting %d TSM files", len(tsmFiles))
-
-		files, err := e.Compactor.Compact(tsmFiles)
-		if err != nil {
-			e.logger.Printf("error compacting TSM files: %v", err)
-			time.Sleep(time.Second)
-			continue
-		}
-
-		if err := e.FileStore.Replace(tsmFiles, files); err != nil {
-			e.logger.Printf("error replacing new TSM files: %v", err)
-			time.Sleep(time.Second)
-			continue
-		}
-
-		e.logger.Printf("compacted %d tsm into %d files in %s",
-			len(tsmFiles), len(files), time.Since(start))
 	}
 }
 
-// reloadCache reads the WAL segment files and loads them into the cache. It also stores
-// the measurements, series and fields defined in the WAL so that it can be used in the
-// LoadMetadataFromIndex function.
+// reloadCache reads the WAL segment files and loads them into the cache.
 func (e *DevEngine) reloadCache() error {
 	files, err := segmentFileNames(e.WAL.Path())
 	if err != nil {
 		return err
 	}
 
-	for _, fn := range files {
-		f, err := os.Open(fn)
-		if err != nil {
-			return err
-		}
-
-		r := NewWALSegmentReader(f)
-		defer r.Close()
-
-		// Iterate over each reader in order.  Later readers will overwrite earlier ones if values
-		// overlap.
-		for r.Next() {
-			entry, err := r.Read()
-			if err != nil {
-				return err
-			}
-
-			switch t := entry.(type) {
-			case *WriteWALEntry:
-				if err := e.Cache.WriteMulti(t.Values); err != nil {
-					return err
-				}
-			case *DeleteWALEntry:
-				// FIXME: Implement this
-				// if err := e.Cache.Delete(t.Keys); err != nil {
-				// 	return err
-				// }
-			}
-		}
+	loader := NewCacheLoader(files)
+	if err := loader.Load(e.Cache); err != nil {
+		return err
 	}
+
 	return nil
 }
 
@@ -546,6 +595,7 @@ func (c *devCursor) SeekTo(seek int64) (int64, interface{}) {
 		c.tsmValueBuf = c.tsmValues[c.tsmPos].Value()
 	} else {
 		c.tsmKeyBuf = tsdb.EOF
+		c.tsmKeyCursor.Close()
 	}
 
 	return c.read()
@@ -619,6 +669,7 @@ func (c *devCursor) nextTSM() (int64, interface{}) {
 		if c.tsmPos >= len(c.tsmValues) {
 			c.tsmValues, _ = c.tsmKeyCursor.Next(c.ascending)
 			if len(c.tsmValues) == 0 {
+				c.tsmKeyCursor.Close()
 				return tsdb.EOF, nil
 			}
 			c.tsmPos = 0
@@ -629,12 +680,18 @@ func (c *devCursor) nextTSM() (int64, interface{}) {
 		if c.tsmPos < 0 {
 			c.tsmValues, _ = c.tsmKeyCursor.Next(c.ascending)
 			if len(c.tsmValues) == 0 {
+				c.tsmKeyCursor.Close()
 				return tsdb.EOF, nil
 			}
 			c.tsmPos = len(c.tsmValues) - 1
 		}
 		return c.tsmValues[c.tsmPos].UnixNano(), c.tsmValues[c.tsmPos].Value()
 	}
+}
+
+// SeriesFieldKey combine a series key and field name for a unique string to be hashed to a numeric ID
+func SeriesFieldKey(seriesKey, field string) string {
+	return seriesKey + keyFieldSeparator + field
 }
 
 func tsmFieldTypeToInfluxQLDataType(typ byte) (influxql.DataType, error) {
@@ -648,6 +705,14 @@ func tsmFieldTypeToInfluxQLDataType(typ byte) (influxql.DataType, error) {
 	case BlockString:
 		return influxql.String, nil
 	default:
-		return influxql.Unknown, fmt.Errorf("unkown block type: %v", typ)
+		return influxql.Unknown, fmt.Errorf("unknown block type: %v", typ)
 	}
+}
+
+func seriesAndFieldFromCompositeKey(key string) (string, string) {
+	parts := strings.Split(key, keyFieldSeparator)
+	if len(parts) != 0 {
+		return parts[0], strings.Join(parts[1:], keyFieldSeparator)
+	}
+	return parts[0], parts[1]
 }

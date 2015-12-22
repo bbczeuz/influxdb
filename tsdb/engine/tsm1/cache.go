@@ -2,6 +2,8 @@ package tsm1
 
 import (
 	"fmt"
+	"log"
+	"os"
 	"sort"
 	"sync"
 )
@@ -209,6 +211,16 @@ func (c *Cache) Values(key string) Values {
 	}()
 }
 
+// Delete will remove the keys from the cache
+func (c *Cache) Delete(keys []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, k := range keys {
+		delete(c.store, k)
+	}
+}
+
 // merged returns a copy of hot and snapshot values. The copy will be merged, deduped, and
 // sorted. It assumes all necessary locks have been taken. If the caller knows that the
 // the hot source data for the key will not be changed, it is safe to call this function
@@ -298,4 +310,72 @@ func (c *Cache) write(key string, values []Value) {
 		c.store[key] = e
 	}
 	e.add(values)
+}
+
+// CacheLoader processes a set of WAL segment files, and loads a cache with the data
+// contained within those files.  Processing of the supplied files take place in the
+// order they exist in the files slice.
+type CacheLoader struct {
+	files []string
+
+	Logger *log.Logger
+}
+
+// NewCacheLoader returns a new instance of a CacheLoader.
+func NewCacheLoader(files []string) *CacheLoader {
+	return &CacheLoader{
+		files:  files,
+		Logger: log.New(os.Stderr, "[cacheloader] ", log.LstdFlags),
+	}
+}
+
+// Load returns a cache loaded with the data contained within the segment files.
+// If, during reading of a segment file, corruption is encountered, that segment
+// file is truncated up to and including the last valid byte, and processing
+// continues with the next segment file.
+func (cl *CacheLoader) Load(cache *Cache) error {
+	for _, fn := range cl.files {
+		if err := func() error {
+			f, err := os.OpenFile(fn, os.O_CREATE|os.O_RDWR, 0666)
+			if err != nil {
+				return err
+			}
+
+			// Log some information about the segments.
+			stat, err := os.Stat(f.Name())
+			if err != nil {
+				return err
+			}
+			cl.Logger.Printf("reading file %s, size %d", f.Name(), stat.Size())
+
+			r := NewWALSegmentReader(f)
+			defer r.Close()
+
+			for r.Next() {
+				entry, err := r.Read()
+				if err != nil {
+					n := r.Count()
+					cl.Logger.Printf("file %s corrupt at position %d, truncating", f.Name(), n)
+					if err := f.Truncate(n); err != nil {
+						return err
+					}
+					break
+				}
+
+				switch t := entry.(type) {
+				case *WriteWALEntry:
+					if err := cache.WriteMulti(t.Values); err != nil {
+						return err
+					}
+				case *DeleteWALEntry:
+					cache.Delete(t.Keys)
+				}
+			}
+
+			return nil
+		}(); err != nil {
+			return err
+		}
+	}
+	return nil
 }

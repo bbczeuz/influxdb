@@ -1,7 +1,30 @@
-## v0.9.6 [unreleased]
+## v0.10.0 [unreleased]
+
+With this release InfluxDB is moving to Go 1.5.
 
 ### Features
-- [#4866](https://github.com/influxdb/influxdb/pull/4866): Configurable default retention policy on database creation. Thanks @pires
+
+### Bugfixes
+- [#5042](https://github.com/influxdb/influxdb/issues/5042): Count with fill(none) will drop 0 valued intervals.
+- [#4735](https://github.com/influxdb/influxdb/issues/4735): Fix panic when merging empty results.
+- [#5016](https://github.com/influxdb/influxdb/pull/5016): Don't panic if Meta data directory not writable. Thanks @oiooj
+- [#5059](https://github.com/influxdb/influxdb/pull/5059): Fix unmarshal of database error by client code. Thanks @farshidtz
+- [#4940](https://github.com/influxdb/influxdb/pull/4940): Fix distributed aggregate query query error. Thanks @li-ang
+- [#4622](https://github.com/influxdb/influxdb/issues/4622): Fix panic when passing too large of timestamps to OpenTSDB input.
+- [#5064](https://github.com/influxdb/influxdb/pull/5064): Full support for parenthesis in SELECT clause, fixes [#5054](https://github.com/influxdb/influxdb/issues/5054). Thanks @mengjinglei
+- [#5079](https://github.com/influxdb/influxdb/pull/5079): Ensure tsm WAL encoding buffer can handle large batches.
+- [#4303](https://github.com/influxdb/influxdb/issues/4303): Don't drop measurements or series from multiple databases.
+- [#5078](https://github.com/influxdb/influxdb/issues/5078): influx non-interactive mode - INSERT must be handled. Thanks @grange74
+- [[#5178](https://github.com/influxdb/influxdb/pull/5178): SHOW FIELD shouln't consider VALUES to be valid. Thanks @pires
+
+## v0.9.6 [2015-12-09]
+
+### Release Notes
+This release has an updated design and implementation of the TSM storage engine. If you had been using tsm1 as your storage engine prior to this release (either 0.9.5.x or 0.9.6 nightly builds) you will have to start with a fresh database.
+
+If you had TSM configuration options set, those have been updated. See the the updated sample configuration for more details: https://github.com/influxdb/influxdb/blob/master/etc/config.sample.toml#L98-L125
+
+### Features
 - [#4790](https://github.com/influxdb/influxdb/pull/4790): Allow openTSDB point-level error logging to be disabled
 - [#4728](https://github.com/influxdb/influxdb/pull/4728): SHOW SHARD GROUPS. By @mateuszdyminski
 - [#4841](https://github.com/influxdb/influxdb/pull/4841): Improve point parsing speed. Lint models pacakge. Thanks @e-dard!
@@ -9,8 +32,10 @@
 - [#2676](https://github.com/influxdb/influxdb/issues/2676), [#4866](https://github.com/influxdb/influxdb/pull/4866): Add support for specifying default retention policy in database create. Thanks @pires!
 - [#4848](https://github.com/influxdb/influxdb/pull/4848): Added framework for cluster integration testing.
 - [#4872](https://github.com/influxdb/influxdb/pull/4872): Add option to disable logging for meta service.
+- [#4787](https://github.com/influxdb/influxdb/issues/4787): Now builds on Solaris
 
 ### Bugfixes
+- [#4849](https://github.com/influxdb/influxdb/issues/4849): Derivative works with count, mean, median, sum, first, last, max, min, and percentile.
 - [#4984](https://github.com/influxdb/influxdb/pull/4984): Allow math on fields, fixes regression. Thanks @mengjinglei
 - [#4666](https://github.com/influxdb/influxdb/issues/4666): Fix panic in derivative with invalid values.
 - [#4404](https://github.com/influxdb/influxdb/issues/4404): Return better error for currently unsupported DELETE queries.
@@ -31,6 +56,7 @@
 - [#4878](https://github.com/influxdb/influxdb/pull/4878): Fix String() function for several InfluxQL statement types
 - [#4913](https://github.com/influxdb/influxdb/pull/4913): Fix b1 flush deadlock
 - [#3170](https://github.com/influxdb/influxdb/issues/3170), [#4921](https://github.com/influxdb/influxdb/pull/4921): Database does not exist error is now JSON. Thanks @pires!
+- [#5029](https://github.com/influxdb/influxdb/pull/5029): Drop UDP point on bad parse.
 
 ## v0.9.5 [2015-11-20]
 

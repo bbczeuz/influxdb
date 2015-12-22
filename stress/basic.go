@@ -2,17 +2,19 @@ package stress
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"math/rand"
 	"net/http"
-	"net/url"
 	"sync"
 	"time"
 
 	"github.com/influxdb/influxdb/client/v2"
 )
+
+const backoffInterval = time.Duration(500 * time.Millisecond)
 
 // AbstractTag is a struct that abstractly
 // defines a tag
@@ -245,7 +247,22 @@ type BasicClient struct {
 	Concurrency   int      `toml:"concurrency"`
 	SSL           bool     `toml:"ssl"`
 	Format        string   `toml:"format"`
-	addrId        int
+
+	addrId   int
+	r        chan<- response
+	interval time.Duration
+}
+
+func (c *BasicClient) retry(b []byte, backoff time.Duration) {
+	bo := backoff + backoffInterval
+	rs, err := c.send(b)
+	time.Sleep(c.interval)
+
+	c.r <- rs
+	if !rs.Success() || err != nil {
+		time.Sleep(bo)
+		c.retry(b, bo)
+	}
 }
 
 // Batch groups together points
@@ -260,6 +277,7 @@ func (c *BasicClient) Batch(ps <-chan Point, r chan<- response) error {
 
 	c.Addresses = instanceURLs
 
+	c.r = r
 	var buf bytes.Buffer
 	var wg sync.WaitGroup
 	counter := NewConcurrencyLimiter(c.Concurrency)
@@ -268,6 +286,7 @@ func (c *BasicClient) Batch(ps <-chan Point, r chan<- response) error {
 	if err != nil {
 		return err
 	}
+	c.interval = interval
 
 	ctr := 0
 
@@ -288,22 +307,14 @@ func (c *BasicClient) Batch(ps <-chan Point, r chan<- response) error {
 			wg.Add(1)
 			counter.Increment()
 			go func(byt []byte) {
-				defer wg.Done()
-
-				rs, err := c.send(byt)
-				if err != nil {
-					fmt.Println(err)
-				}
-				time.Sleep(interval)
-
+				c.retry(byt, time.Duration(1))
 				counter.Decrement()
-				r <- rs
+				wg.Done()
 			}(b)
 
 			var temp bytes.Buffer
 			buf = temp
 		}
-
 	}
 
 	wg.Wait()
@@ -325,7 +336,8 @@ func post(url string, datatype string, data io.Reader) (*http.Response, error) {
 	}
 
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf(string(body))
+		err := errors.New(string(body))
+		return nil, err
 	}
 
 	return resp, nil
@@ -521,8 +533,74 @@ func (b *BasicProvisioner) Provision() error {
 	return nil
 }
 
+type BroadcastChannel struct {
+	chs []chan response
+	wg  sync.WaitGroup
+	fns []func(t *Timer)
+}
+
+func NewBroadcastChannel() *BroadcastChannel {
+	chs := make([]chan response, 0)
+
+	var wg sync.WaitGroup
+
+	b := &BroadcastChannel{
+		chs: chs,
+		wg:  wg,
+	}
+
+	return b
+}
+
+func (b *BroadcastChannel) Register(fn responseHandler) {
+	ch := make(chan response, 0)
+
+	b.chs = append(b.chs, ch)
+
+	f := func(t *Timer) {
+		go fn(ch, t)
+	}
+
+	b.fns = append(b.fns, f)
+}
+
+func (b *BroadcastChannel) Broadcast(r response) {
+
+	b.wg.Add(1)
+	for _, ch := range b.chs {
+		b.wg.Add(1)
+		go func(ch chan response) {
+			ch <- r
+			b.wg.Done()
+		}(ch)
+	}
+	b.wg.Done()
+}
+
+func (b *BroadcastChannel) Close() {
+	b.wg.Wait()
+	for _, ch := range b.chs {
+		close(ch)
+		// Workaround
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func (b *BroadcastChannel) Handle(rs <-chan response, t *Timer) {
+
+	// Start all of the handlers
+	for _, fn := range b.fns {
+		fn(t)
+	}
+
+	for i := range rs {
+		b.Broadcast(i)
+	}
+	b.Close()
+}
+
 // BasicWriteHandler handles write responses.
-func BasicWriteHandler(rs <-chan response, wt *Timer) {
+func (b *BasicClient) BasicWriteHandler(rs <-chan response, wt *Timer) {
 	n := 0
 	success := 0
 	fail := 0
@@ -551,57 +629,11 @@ func BasicWriteHandler(rs <-chan response, wt *Timer) {
 	fmt.Printf("	Success: %v\n", success)
 	fmt.Printf("	Fail: %v\n", fail)
 	fmt.Printf("Average Response Time: %v\n", s/time.Duration(n))
-	fmt.Printf("Points Per Second: %v\n\n", float64(n)*float64(10000)/float64(wt.Elapsed().Seconds()))
-}
-
-func (b *BasicClient) HTTPWriteHandler(rs <-chan response, wt *Timer) {
-	n := 0
-	success := 0
-	fail := 0
-
-	s := time.Duration(0)
-
-	for t := range rs {
-
-		// Send off data to influx coordination server
-
-		n++
-
-		if t.Success() {
-			success++
-		} else {
-			fail++
-		}
-
-		s += t.Timer.Elapsed()
-
-	}
-
-	if n == 0 {
-		return
-	}
-
-	pps := float64(n) * float64(b.BatchSize) / float64(wt.Elapsed().Seconds())
-
-	vals := url.Values{
-		"PerfConfig":      {"some config file"},
-		"InfluxConfig":    {"some config file"},
-		"TestId":          {"1"},
-		"Name":            {"some name"},
-		"BatchSize":       {fmt.Sprintf("%v", int(b.BatchSize))},
-		"BatchInterval":   {fmt.Sprintf("%v", b.BatchInterval)},
-		"Concurrency":     {fmt.Sprintf("%v", int(b.Concurrency))},
-		"PointsPerSecond": {fmt.Sprintf("%v", int(pps))},
-		"FailRequests":    {fmt.Sprintf("%v", int(fail))},
-		"SuccessRequests": {fmt.Sprintf("%v", int(success))},
-	}
-
-	http.PostForm(fmt.Sprintf("http://%s/results", "localhost:8080"), vals)
-
+	fmt.Printf("Points Per Second: %v\n\n", int(float64(n)*float64(b.BatchSize)/float64(wt.Elapsed().Seconds())))
 }
 
 // BasicReadHandler handles read responses.
-func BasicReadHandler(r <-chan response, rt *Timer) {
+func (b *BasicQueryClient) BasicReadHandler(r <-chan response, rt *Timer) {
 	n := 0
 	s := time.Duration(0)
 	for t := range r {
@@ -615,4 +647,36 @@ func BasicReadHandler(r <-chan response, rt *Timer) {
 
 	fmt.Printf("Total Queries: %v\n", n)
 	fmt.Printf("Average Query Response Time: %v\n\n", s/time.Duration(n))
+}
+
+func (o *outputConfig) HTTPHandler(method string) func(r <-chan response, rt *Timer) {
+	return func(r <-chan response, rt *Timer) {
+		c, _ := client.NewHTTPClient(client.HTTPConfig{
+			Addr: o.addr,
+		})
+		bp, _ := client.NewBatchPoints(client.BatchPointsConfig{
+			Database:  o.database,
+			Precision: "ns",
+		})
+		for p := range r {
+			tags := o.tags
+			tags["method"] = method
+			fields := map[string]interface{}{
+				"response_time": p.Timer.Elapsed(),
+			}
+			pt, _ := client.NewPoint("performance", tags, fields, p.Time)
+			bp.AddPoint(pt)
+			if len(bp.Points())%1000 == 0 && len(bp.Points()) != 0 {
+				c.Write(bp)
+				bp, _ = client.NewBatchPoints(client.BatchPointsConfig{
+					Database:  o.database,
+					Precision: "ns",
+				})
+			}
+		}
+
+		if len(bp.Points()) != 0 {
+			c.Write(bp)
+		}
+	}
 }

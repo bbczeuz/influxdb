@@ -343,11 +343,11 @@ func (s *CreateDatabaseStatement) String() string {
 	}
 	_, _ = buf.WriteString(QuoteIdent(s.Name))
 	if s.RetentionPolicyCreate {
-		_, _ = buf.WriteString("WITH DURATION ")
+		_, _ = buf.WriteString(" WITH DURATION ")
 		_, _ = buf.WriteString(s.RetentionPolicyDuration.String())
-		_, _ = buf.WriteString("REPLICATION ")
+		_, _ = buf.WriteString(" REPLICATION ")
 		_, _ = buf.WriteString(strconv.Itoa(s.RetentionPolicyReplication))
-		_, _ = buf.WriteString("NAME ")
+		_, _ = buf.WriteString(" NAME ")
 		_, _ = buf.WriteString(QuoteIdent(s.RetentionPolicyName))
 	}
 
@@ -772,7 +772,7 @@ func (s *SelectStatement) SourceNames() []string {
 // derivative aggregate
 func (s *SelectStatement) HasDerivative() bool {
 	for _, f := range s.FunctionCalls() {
-		if strings.HasSuffix(f.Name, "derivative") {
+		if f.Name == "derivative" || f.Name == "non_negative_derivative" {
 			return true
 		}
 	}
@@ -783,11 +783,39 @@ func (s *SelectStatement) HasDerivative() bool {
 // variable ref as the first arg
 func (s *SelectStatement) IsSimpleDerivative() bool {
 	for _, f := range s.FunctionCalls() {
-		if strings.HasSuffix(f.Name, "derivative") {
+		if f.Name == "derivative" || f.Name == "non_negative_derivative" {
 			// it's nested if the first argument is an aggregate function
 			if _, ok := f.Args[0].(*VarRef); ok {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+// HasSimpleCount return true if one of the function calls is a count function with a
+// variable ref as the first arg
+func (s *SelectStatement) HasSimpleCount() bool {
+	// recursively check for a simple count(varref) function
+	var hasCount func(f *Call) bool
+	hasCount = func(f *Call) bool {
+		if f.Name == "count" {
+			// it's nested if the first argument is an aggregate function
+			if _, ok := f.Args[0].(*VarRef); ok {
+				return true
+			}
+		} else {
+			for _, arg := range f.Args {
+				if child, ok := arg.(*Call); ok {
+					return hasCount(child)
+				}
+			}
+		}
+		return false
+	}
+	for _, f := range s.FunctionCalls() {
+		if hasCount(f) {
+			return true
 		}
 	}
 	return false
@@ -2415,7 +2443,7 @@ func (a Fields) AliasNames() []string {
 	return names
 }
 
-// Names returns a list of raw field names.
+// Names returns a list of field names.
 func (a Fields) Names() []string {
 	names := []string{}
 	for _, f := range a {
@@ -2425,6 +2453,8 @@ func (a Fields) Names() []string {
 		case *VarRef:
 			names = append(names, expr.Val)
 		case *BinaryExpr:
+			names = append(names, walkNames(expr)...)
+		case *ParenExpr:
 			names = append(names, walkNames(expr)...)
 		}
 	}
