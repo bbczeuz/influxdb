@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/influxdb/influxdb/models"
+	"github.com/influxdata/influxdb/models"
 )
 
 var (
@@ -112,7 +112,40 @@ func BenchmarkParsePointsTagsUnSorted10(b *testing.B) {
 	}
 }
 
-func test(t *testing.T, line string, point models.Point) {
+func BenchmarkParseKey(b *testing.B) {
+	line := `cpu,region=us-west,host=serverA,env=prod,target=servers,zone=1c,tag1=value1,tag2=value2,tag3=value3,tag4=value4,tag5=value5`
+	for i := 0; i < b.N; i++ {
+		models.ParseKey(line)
+	}
+}
+
+// TestPoint wraps a models.Point but also makes available the raw
+// arguments to the Point.
+//
+// This is useful for ensuring that comparisons between results of
+// operations on Points match the expected input data to the Point,
+// since models.Point does not expose the raw input data (e.g., tags)
+// via its API.
+type TestPoint struct {
+	RawFields models.Fields
+	RawTags   models.Tags
+	RawTime   time.Time
+	models.Point
+}
+
+// NewTestPoint returns a new TestPoint.
+//
+// NewTestPoint panics if it is not a valid models.Point.
+func NewTestPoint(name string, tags models.Tags, fields models.Fields, time time.Time) TestPoint {
+	return TestPoint{
+		RawTags:   tags,
+		RawFields: fields,
+		RawTime:   time,
+		Point:     models.MustNewPoint(name, tags, fields, time),
+	}
+}
+
+func test(t *testing.T, line string, point TestPoint) {
 	pts, err := models.ParsePointsWithPrecision([]byte(line), time.Unix(0, 0), "n")
 	if err != nil {
 		t.Fatalf(`ParsePoints("%s") mismatch. got %v, exp nil`, line, err)
@@ -130,13 +163,13 @@ func test(t *testing.T, line string, point models.Point) {
 		t.Errorf(`ParsePoints("%s") tags mismatch. got %v, exp %v`, line, pts[0].Tags(), exp)
 	}
 
-	for tag, value := range point.Tags() {
-		if pts[0].Tags()[tag] != value {
-			t.Errorf(`ParsePoints("%s") tags mismatch. got %v, exp %v`, line, pts[0].Tags()[tag], value)
+	for tag, value := range pts[0].Tags() {
+		if value != point.RawTags[tag] {
+			t.Errorf(`ParsePoints("%s") tags mismatch. got %v, exp %v`, line, value, point.RawTags[tag])
 		}
 	}
 
-	for name, value := range point.Fields() {
+	for name, value := range point.RawFields {
 		val := pts[0].Fields()[name]
 		expfval, ok := val.(float64)
 
@@ -146,7 +179,7 @@ func test(t *testing.T, line string, point models.Point) {
 				t.Errorf(`ParsePoints("%s") field '%s' mismatch. exp NaN`, line, name)
 			}
 		} else if !reflect.DeepEqual(pts[0].Fields()[name], value) {
-			t.Errorf(`ParsePoints("%s") field '%s' mismatch. got %v, exp %v`, line, name, pts[0].Fields()[name], value)
+			t.Errorf(`ParsePoints("%s") field '%s' mismatch. got %[3]v (%[3]T), exp %[4]v (%[4]T)`, line, name, pts[0].Fields()[name], value)
 		}
 	}
 
@@ -201,7 +234,7 @@ func TestParsePointNoFields(t *testing.T) {
 }
 
 func TestParsePointNoTimestamp(t *testing.T) {
-	test(t, "cpu value=1", models.MustNewPoint("cpu", nil, models.Fields{"value": 1.0}, time.Unix(0, 0)))
+	test(t, "cpu value=1", NewTestPoint("cpu", nil, models.Fields{"value": 1.0}, time.Unix(0, 0)))
 }
 
 func TestParsePointMissingQuote(t *testing.T) {
@@ -253,6 +286,7 @@ func TestParsePointMissingTagValue(t *testing.T) {
 	examples := []string{
 		`cpu,host`,
 		`cpu,host,`,
+		`cpu,host=`,
 		`cpu,host value=1i`,
 		`cpu,host=serverA,region value=1i`,
 		`cpu,host=serverA,region= value=1i`,
@@ -335,17 +369,22 @@ func TestParsePointMissingFieldValue(t *testing.T) {
 }
 
 func TestParsePointBadNumber(t *testing.T) {
-	_, err := models.ParsePointsString(`cpu,host=serverA,region=us-west value=1a`)
-	if err == nil {
-		t.Errorf(`ParsePoints("%s") mismatch. got nil, exp error`, `cpu,host=serverA,region=us-west value=1a`)
-	}
-	_, err = models.ParsePointsString(`cpu,host=serverA,region=us-west value=1ii`)
-	if err == nil {
-		t.Errorf(`ParsePoints("%s") mismatch. got nil, exp error`, `cpu,host=serverA,region=us-west value=1ii`)
-	}
-	_, err = models.ParsePointsString(`cpu,host=serverA,region=us-west value=1.0i`)
-	if err == nil {
-		t.Errorf(`ParsePoints("%s") mismatch. got nil, exp error`, `cpu,host=serverA,region=us-west value=1.0i`)
+	for _, tt := range []string{
+		"cpu v=- ",
+		"cpu v=-i ",
+		"cpu v=-. ",
+		"cpu v=. ",
+		"cpu v=1.0i ",
+		"cpu v=1ii ",
+		"cpu v=1a ",
+		"cpu v=-e-e-e ",
+		"cpu v=42+3 ",
+		"cpu v= ",
+	} {
+		_, err := models.ParsePointsString(tt)
+		if err == nil {
+			t.Errorf("Point %q should be invalid", tt)
+		}
 	}
 }
 
@@ -554,22 +593,64 @@ func TestParsePointScientificIntInvalid(t *testing.T) {
 	}
 }
 
+func TestParsePointWhitespace(t *testing.T) {
+	examples := []string{
+		`cpu    value=1.0 1257894000000000000`,
+		`cpu value=1.0     1257894000000000000`,
+		`cpu      value=1.0     1257894000000000000`,
+		`cpu value=1.0 1257894000000000000   `,
+		`cpu value=1.0 1257894000000000000
+`,
+		`cpu   value=1.0 1257894000000000000
+`,
+	}
+
+	expPoint := NewTestPoint("cpu", models.Tags{}, models.Fields{"value": 1.0}, time.Unix(0, 1257894000000000000))
+	for i, example := range examples {
+		pts, err := models.ParsePoints([]byte(example))
+		if err != nil {
+			t.Fatalf(`[Example %d] ParsePoints("%s") error. got %v, exp nil`, i, example, err)
+		}
+
+		if got, exp := len(pts), 1; got != exp {
+			t.Fatalf("[Example %d] got %d points, expected %d", i, got, exp)
+		}
+
+		if got, exp := pts[0].Name(), expPoint.Name(); got != exp {
+			t.Fatalf("[Example %d] got %v measurement, expected %v", i, got, exp)
+		}
+
+		if got, exp := len(pts[0].Fields()), len(expPoint.Fields()); got != exp {
+			t.Fatalf("[Example %d] got %d fields, expected %d", i, got, exp)
+		}
+
+		if got, exp := pts[0].Fields()["value"], expPoint.Fields()["value"]; got != exp {
+			t.Fatalf(`[Example %d] got %v for field "value", expected %v`, i, got, exp)
+		}
+
+		if got, exp := pts[0].Time().UnixNano(), expPoint.Time().UnixNano(); got != exp {
+			t.Fatalf(`[Example %d] got %d time, expected %d`, i, got, exp)
+		}
+	}
+}
+
 func TestParsePointUnescape(t *testing.T) {
+	// commas in measurement name
 	test(t, `foo\,bar value=1i`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"foo,bar", // comma in the name
 			models.Tags{},
 			models.Fields{
-				"value": 1,
+				"value": int64(1),
 			},
 			time.Unix(0, 0)))
 
-	// commas in measurement name
-	test(t, `cpu\,main,regions=east\,west value=1.0`,
-		models.MustNewPoint(
+	// comma in measurement name with tags
+	test(t, `cpu\,main,regions=east value=1.0`,
+		NewTestPoint(
 			"cpu,main", // comma in the name
 			models.Tags{
-				"regions": "east,west",
+				"regions": "east",
 			},
 			models.Fields{
 				"value": 1.0,
@@ -578,7 +659,7 @@ func TestParsePointUnescape(t *testing.T) {
 
 	// spaces in measurement name
 	test(t, `cpu\ load,region=east value=1.0`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu load", // space in the name
 			models.Tags{
 				"region": "east",
@@ -590,7 +671,7 @@ func TestParsePointUnescape(t *testing.T) {
 
 	// equals in measurement name
 	test(t, `cpu\=load,region=east value=1.0`,
-		models.MustNewPoint(
+		NewTestPoint(
 			`cpu\=load`, // backslash is literal
 			models.Tags{
 				"region": "east",
@@ -602,7 +683,7 @@ func TestParsePointUnescape(t *testing.T) {
 
 	// equals in measurement name
 	test(t, `cpu=load,region=east value=1.0`,
-		models.MustNewPoint(
+		NewTestPoint(
 			`cpu=load`, // literal equals is fine in measurement name
 			models.Tags{
 				"region": "east",
@@ -614,7 +695,7 @@ func TestParsePointUnescape(t *testing.T) {
 
 	// commas in tag names
 	test(t, `cpu,region\,zone=east value=1.0`,
-		models.MustNewPoint("cpu",
+		NewTestPoint("cpu",
 			models.Tags{
 				"region,zone": "east", // comma in the tag key
 			},
@@ -625,7 +706,7 @@ func TestParsePointUnescape(t *testing.T) {
 
 	// spaces in tag name
 	test(t, `cpu,region\ zone=east value=1.0`,
-		models.MustNewPoint("cpu",
+		NewTestPoint("cpu",
 			models.Tags{
 				"region zone": "east", // space in the tag name
 			},
@@ -634,9 +715,20 @@ func TestParsePointUnescape(t *testing.T) {
 			},
 			time.Unix(0, 0)))
 
+	// backslash with escaped equals in tag name
+	test(t, `cpu,reg\\=ion=east value=1.0`,
+		NewTestPoint("cpu",
+			models.Tags{
+				`reg\=ion`: "east",
+			},
+			models.Fields{
+				"value": 1.0,
+			},
+			time.Unix(0, 0)))
+
 	// space is tag name
 	test(t, `cpu,\ =east value=1.0`,
-		models.MustNewPoint("cpu",
+		NewTestPoint("cpu",
 			models.Tags{
 				" ": "east", // tag name is single space
 			},
@@ -647,7 +739,7 @@ func TestParsePointUnescape(t *testing.T) {
 
 	// commas in tag values
 	test(t, `cpu,regions=east\,west value=1.0`,
-		models.MustNewPoint("cpu",
+		NewTestPoint("cpu",
 			models.Tags{
 				"regions": "east,west", // comma in the tag value
 			},
@@ -656,9 +748,45 @@ func TestParsePointUnescape(t *testing.T) {
 			},
 			time.Unix(0, 0)))
 
+	// backslash literal followed by escaped space
+	test(t, `cpu,regions=\\ east value=1.0`,
+		NewTestPoint(
+			"cpu",
+			models.Tags{
+				"regions": `\ east`,
+			},
+			models.Fields{
+				"value": 1.0,
+			},
+			time.Unix(0, 0)))
+
+	// backslash literal followed by escaped space
+	test(t, `cpu,regions=eas\\ t value=1.0`,
+		NewTestPoint(
+			"cpu",
+			models.Tags{
+				"regions": `eas\ t`,
+			},
+			models.Fields{
+				"value": 1.0,
+			},
+			time.Unix(0, 0)))
+
+	// backslash literal followed by trailing space
+	test(t, `cpu,regions=east\\  value=1.0`,
+		NewTestPoint(
+			"cpu",
+			models.Tags{
+				"regions": `east\ `,
+			},
+			models.Fields{
+				"value": 1.0,
+			},
+			time.Unix(0, 0)))
+
 	// spaces in tag values
 	test(t, `cpu,regions=east\ west value=1.0`,
-		models.MustNewPoint("cpu",
+		NewTestPoint("cpu",
 			models.Tags{
 				"regions": "east west", // comma in the tag value
 			},
@@ -669,7 +797,7 @@ func TestParsePointUnescape(t *testing.T) {
 
 	// commas in field keys
 	test(t, `cpu,regions=east value\,ms=1.0`,
-		models.MustNewPoint("cpu",
+		NewTestPoint("cpu",
 			models.Tags{
 				"regions": "east",
 			},
@@ -680,7 +808,7 @@ func TestParsePointUnescape(t *testing.T) {
 
 	// spaces in field keys
 	test(t, `cpu,regions=east value\ ms=1.0`,
-		models.MustNewPoint("cpu",
+		NewTestPoint("cpu",
 			models.Tags{
 				"regions": "east",
 			},
@@ -691,7 +819,7 @@ func TestParsePointUnescape(t *testing.T) {
 
 	// tag with no value
 	test(t, `cpu,regions=east value="1"`,
-		models.MustNewPoint("cpu",
+		NewTestPoint("cpu",
 			models.Tags{
 				"regions": "east",
 				"foobar":  "",
@@ -703,7 +831,7 @@ func TestParsePointUnescape(t *testing.T) {
 
 	// commas in field values
 	test(t, `cpu,regions=east value="1,0"`,
-		models.MustNewPoint("cpu",
+		NewTestPoint("cpu",
 			models.Tags{
 				"regions": "east",
 			},
@@ -714,7 +842,7 @@ func TestParsePointUnescape(t *testing.T) {
 
 	// random character escaped
 	test(t, `cpu,regions=eas\t value=1.0`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu",
 			models.Tags{
 				"regions": "eas\\t",
@@ -726,7 +854,7 @@ func TestParsePointUnescape(t *testing.T) {
 
 	// backslash literal followed by escaped characters
 	test(t, `cpu,regions=\\,\,\=east value=1.0`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu",
 			models.Tags{
 				"regions": `\,,=east`,
@@ -738,23 +866,23 @@ func TestParsePointUnescape(t *testing.T) {
 
 	// field keys using escape char.
 	test(t, `cpu \a=1i`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu",
 			models.Tags{},
 			models.Fields{
-				"\\a": 1, // Left as parsed since it's not a known escape sequence.
+				"\\a": int64(1), // Left as parsed since it's not a known escape sequence.
 			},
 			time.Unix(0, 0)))
 
 	// measurement, tag and tag value with equals
 	test(t, `cpu=load,equals\=foo=tag\=value value=1i`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu=load", // Not escaped
 			models.Tags{
 				"equals=foo": "tag=value", // Tag and value unescaped
 			},
 			models.Fields{
-				"value": 1,
+				"value": int64(1),
 			},
 			time.Unix(0, 0)))
 
@@ -763,21 +891,39 @@ func TestParsePointUnescape(t *testing.T) {
 func TestParsePointWithTags(t *testing.T) {
 	test(t,
 		"cpu,host=serverA,region=us-east value=1.0 1000000000",
-		models.MustNewPoint("cpu",
+		NewTestPoint("cpu",
 			models.Tags{"host": "serverA", "region": "us-east"},
 			models.Fields{"value": 1.0}, time.Unix(1, 0)))
 }
 
-func TestParsPointWithDuplicateTags(t *testing.T) {
-	_, err := models.ParsePoints([]byte(`cpu,host=serverA,host=serverB value=1i 1000000000`))
-	if err == nil {
-		t.Fatalf(`ParsePoint() expected error. got nil`)
+func TestParsePointWithDuplicateTags(t *testing.T) {
+	for i, tt := range []struct {
+		line string
+		err  string
+	}{
+		{
+			line: `cpu,host=serverA,host=serverB value=1i 1000000000`,
+			err:  `unable to parse 'cpu,host=serverA,host=serverB value=1i 1000000000': duplicate tags`,
+		},
+		{
+			line: `cpu,b=2,b=1,c=3 value=1i 1000000000`,
+			err:  `unable to parse 'cpu,b=2,b=1,c=3 value=1i 1000000000': duplicate tags`,
+		},
+		{
+			line: `cpu,b=2,c=3,b=1 value=1i 1000000000`,
+			err:  `unable to parse 'cpu,b=2,c=3,b=1 value=1i 1000000000': duplicate tags`,
+		},
+	} {
+		_, err := models.ParsePointsString(tt.line)
+		if err == nil || tt.err != err.Error() {
+			t.Errorf("%d. ParsePoint() expected error '%s'. got '%s'", i, tt.err, err)
+		}
 	}
 }
 
 func TestParsePointWithStringField(t *testing.T) {
 	test(t, `cpu,host=serverA,region=us-east value=1.0,str="foo",str2="bar" 1000000000`,
-		models.MustNewPoint("cpu",
+		NewTestPoint("cpu",
 			models.Tags{
 				"host":   "serverA",
 				"region": "us-east",
@@ -791,7 +937,7 @@ func TestParsePointWithStringField(t *testing.T) {
 	)
 
 	test(t, `cpu,host=serverA,region=us-east str="foo \" bar" 1000000000`,
-		models.MustNewPoint("cpu",
+		NewTestPoint("cpu",
 			models.Tags{
 				"host":   "serverA",
 				"region": "us-east",
@@ -806,7 +952,7 @@ func TestParsePointWithStringField(t *testing.T) {
 
 func TestParsePointWithStringWithSpaces(t *testing.T) {
 	test(t, `cpu,host=serverA,region=us-east value=1.0,str="foo bar" 1000000000`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu",
 			models.Tags{
 				"host":   "serverA",
@@ -822,7 +968,7 @@ func TestParsePointWithStringWithSpaces(t *testing.T) {
 
 func TestParsePointWithStringWithNewline(t *testing.T) {
 	test(t, "cpu,host=serverA,region=us-east value=1.0,str=\"foo\nbar\" 1000000000",
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu",
 			models.Tags{
 				"host":   "serverA",
@@ -839,7 +985,7 @@ func TestParsePointWithStringWithNewline(t *testing.T) {
 func TestParsePointWithStringWithCommas(t *testing.T) {
 	// escaped comma
 	test(t, `cpu,host=serverA,region=us-east value=1.0,str="foo\,bar" 1000000000`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu",
 			models.Tags{
 				"host":   "serverA",
@@ -854,7 +1000,7 @@ func TestParsePointWithStringWithCommas(t *testing.T) {
 
 	// non-escaped comma
 	test(t, `cpu,host=serverA,region=us-east value=1.0,str="foo,bar" 1000000000`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu",
 			models.Tags{
 				"host":   "serverA",
@@ -871,7 +1017,7 @@ func TestParsePointWithStringWithCommas(t *testing.T) {
 func TestParsePointQuotedMeasurement(t *testing.T) {
 	// non-escaped comma
 	test(t, `"cpu",host=serverA,region=us-east value=1.0 1000000000`,
-		models.MustNewPoint(
+		NewTestPoint(
 			`"cpu"`,
 			models.Tags{
 				"host":   "serverA",
@@ -886,7 +1032,7 @@ func TestParsePointQuotedMeasurement(t *testing.T) {
 
 func TestParsePointQuotedTags(t *testing.T) {
 	test(t, `cpu,"host"="serverA",region=us-east value=1.0 1000000000`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu",
 			models.Tags{
 				`"host"`: `"serverA"`,
@@ -930,7 +1076,7 @@ func TestParsePointsUnbalancedQuotedTags(t *testing.T) {
 func TestParsePointEscapedStringsAndCommas(t *testing.T) {
 	// non-escaped comma and quotes
 	test(t, `cpu,host=serverA,region=us-east value="{Hello\"{,}\" World}" 1000000000`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu",
 			models.Tags{
 				"host":   "serverA",
@@ -944,7 +1090,7 @@ func TestParsePointEscapedStringsAndCommas(t *testing.T) {
 
 	// escaped comma and quotes
 	test(t, `cpu,host=serverA,region=us-east value="{Hello\"{\,}\" World}" 1000000000`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu",
 			models.Tags{
 				"host":   "serverA",
@@ -959,7 +1105,7 @@ func TestParsePointEscapedStringsAndCommas(t *testing.T) {
 
 func TestParsePointWithStringWithEquals(t *testing.T) {
 	test(t, `cpu,host=serverA,region=us-east str="foo=bar",value=1.0 1000000000`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu",
 			models.Tags{
 				"host":   "serverA",
@@ -975,7 +1121,7 @@ func TestParsePointWithStringWithEquals(t *testing.T) {
 
 func TestParsePointWithStringWithBackslash(t *testing.T) {
 	test(t, `cpu value="test\\\"" 1000000000`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu",
 			models.Tags{},
 			models.Fields{
@@ -985,7 +1131,7 @@ func TestParsePointWithStringWithBackslash(t *testing.T) {
 	)
 
 	test(t, `cpu value="test\\" 1000000000`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu",
 			models.Tags{},
 			models.Fields{
@@ -995,7 +1141,7 @@ func TestParsePointWithStringWithBackslash(t *testing.T) {
 	)
 
 	test(t, `cpu value="test\\\"" 1000000000`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu",
 			models.Tags{},
 			models.Fields{
@@ -1005,7 +1151,7 @@ func TestParsePointWithStringWithBackslash(t *testing.T) {
 	)
 
 	test(t, `cpu value="test\"" 1000000000`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu",
 			models.Tags{},
 			models.Fields{
@@ -1017,7 +1163,7 @@ func TestParsePointWithStringWithBackslash(t *testing.T) {
 
 func TestParsePointWithBoolField(t *testing.T) {
 	test(t, `cpu,host=serverA,region=us-east true=true,t=t,T=T,TRUE=TRUE,True=True,false=false,f=f,F=F,FALSE=FALSE,False=False 1000000000`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu",
 			models.Tags{
 				"host":   "serverA",
@@ -1041,7 +1187,7 @@ func TestParsePointWithBoolField(t *testing.T) {
 
 func TestParsePointUnicodeString(t *testing.T) {
 	test(t, `cpu,host=serverA,region=us-east value="wè" 1000000000`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu",
 			models.Tags{
 				"host":   "serverA",
@@ -1056,7 +1202,7 @@ func TestParsePointUnicodeString(t *testing.T) {
 
 func TestParsePointNegativeTimestamp(t *testing.T) {
 	test(t, `cpu value=1 -1`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu",
 			models.Tags{},
 			models.Fields{
@@ -1067,59 +1213,51 @@ func TestParsePointNegativeTimestamp(t *testing.T) {
 }
 
 func TestParsePointMaxTimestamp(t *testing.T) {
-	test(t, `cpu value=1 9223372036854775807`,
-		models.MustNewPoint(
+	test(t, fmt.Sprintf(`cpu value=1 %d`, models.MaxNanoTime),
+		NewTestPoint(
 			"cpu",
 			models.Tags{},
 			models.Fields{
 				"value": 1.0,
 			},
-			time.Unix(0, int64(1<<63-1))),
+			time.Unix(0, models.MaxNanoTime)),
 	)
 }
 
 func TestParsePointMinTimestamp(t *testing.T) {
-	test(t, `cpu value=1 -9223372036854775807`,
-		models.MustNewPoint(
+	test(t, `cpu value=1 -9223372036854775808`,
+		NewTestPoint(
 			"cpu",
 			models.Tags{},
 			models.Fields{
 				"value": 1.0,
 			},
-			time.Unix(0, -int64(1<<63-1))),
+			time.Unix(0, models.MinNanoTime)),
 	)
 }
 
 func TestParsePointInvalidTimestamp(t *testing.T) {
-	_, err := models.ParsePointsString("cpu value=1 9223372036854775808")
-	if err == nil {
-		t.Fatalf("ParsePoints failed: %v", err)
+	examples := []string{
+		"cpu value=1 9223372036854775808",
+		"cpu value=1 -92233720368547758078",
+		"cpu value=1 -",
+		"cpu value=1 -/",
+		"cpu value=1 -1?",
+		"cpu value=1 1-",
+		"cpu value=1 9223372036854775807 12",
 	}
-	_, err = models.ParsePointsString("cpu value=1 -92233720368547758078")
-	if err == nil {
-		t.Fatalf("ParsePoints failed: %v", err)
-	}
-	_, err = models.ParsePointsString("cpu value=1 -")
-	if err == nil {
-		t.Fatalf("ParsePoints failed: %v", err)
-	}
-	_, err = models.ParsePointsString("cpu value=1 -/")
-	if err == nil {
-		t.Fatalf("ParsePoints failed: %v", err)
-	}
-	_, err = models.ParsePointsString("cpu value=1 -1?")
-	if err == nil {
-		t.Fatalf("ParsePoints failed: %v", err)
-	}
-	_, err = models.ParsePointsString("cpu value=1 1-")
-	if err == nil {
-		t.Fatalf("ParsePoints failed: %v", err)
+
+	for i, example := range examples {
+		_, err := models.ParsePointsString(example)
+		if err == nil {
+			t.Fatalf("[Example %d] ParsePoints failed: %v", i, err)
+		}
 	}
 }
 
 func TestNewPointFloatWithoutDecimal(t *testing.T) {
 	test(t, `cpu value=1 1000000000`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu",
 			models.Tags{},
 			models.Fields{
@@ -1130,7 +1268,7 @@ func TestNewPointFloatWithoutDecimal(t *testing.T) {
 }
 func TestNewPointNegativeFloat(t *testing.T) {
 	test(t, `cpu value=-0.64 1000000000`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu",
 			models.Tags{},
 			models.Fields{
@@ -1142,7 +1280,7 @@ func TestNewPointNegativeFloat(t *testing.T) {
 
 func TestNewPointFloatNoDecimal(t *testing.T) {
 	test(t, `cpu value=1. 1000000000`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu",
 			models.Tags{},
 			models.Fields{
@@ -1154,7 +1292,7 @@ func TestNewPointFloatNoDecimal(t *testing.T) {
 
 func TestNewPointFloatScientific(t *testing.T) {
 	test(t, `cpu value=6.632243e+06 1000000000`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu",
 			models.Tags{},
 			models.Fields{
@@ -1166,11 +1304,11 @@ func TestNewPointFloatScientific(t *testing.T) {
 
 func TestNewPointLargeInteger(t *testing.T) {
 	test(t, `cpu value=6632243i 1000000000`,
-		models.MustNewPoint(
+		NewTestPoint(
 			"cpu",
 			models.Tags{},
 			models.Fields{
-				"value": 6632243, // if incorrectly encoded as a float, it would show up as 6.632243e+06
+				"value": int64(6632243), // if incorrectly encoded as a float, it would show up as 6.632243e+06
 			},
 			time.Unix(1, 0)),
 	)
@@ -1656,5 +1794,73 @@ func TestParsePointsStringWithExtraBuffer(t *testing.T) {
 
 	if key != pointKey {
 		t.Fatalf("expected both keys are same but got %s and %s", key, pointKey)
+	}
+}
+
+func TestParsePointsQuotesInFieldKey(t *testing.T) {
+	buf := `cpu "a=1
+cpu value=2 1`
+	points, err := models.ParsePointsString(buf)
+	if err != nil {
+		t.Fatalf("failed to write points: %s", err.Error())
+	}
+
+	pointFields := points[0].Fields()
+	value, ok := pointFields["\"a"]
+	if !ok {
+		t.Fatalf("expected to parse field '\"a'")
+	}
+
+	if value != float64(1) {
+		t.Fatalf("expected field value to be 1, got %v", value)
+	}
+
+	// The following input should not parse
+	buf = `cpu "\, '= "\ v=1.0`
+	_, err = models.ParsePointsString(buf)
+	if err == nil {
+		t.Fatalf("expected parsing failure but got no error")
+	}
+}
+
+func TestParsePointsQuotesInTags(t *testing.T) {
+	buf := `t159,label=hey\ "ya a=1i,value=0i
+t159,label=another a=2i,value=1i 1`
+	points, err := models.ParsePointsString(buf)
+	if err != nil {
+		t.Fatalf("failed to write points: %s", err.Error())
+	}
+
+	if len(points) != 2 {
+		t.Fatalf("expected 2 points, got %d", len(points))
+	}
+}
+
+func TestNewPointsWithBytesWithCorruptData(t *testing.T) {
+	corrupted := []byte{0, 0, 0, 3, 102, 111, 111, 0, 0, 0, 4, 61, 34, 65, 34, 1, 0, 0, 0, 14, 206, 86, 119, 24, 32, 72, 233, 168, 2, 148}
+	p, err := models.NewPointFromBytes(corrupted)
+	if p != nil || err == nil {
+		t.Fatalf("NewPointFromBytes: got: (%v, %v), expected: (nil, error)", p, err)
+	}
+}
+
+func TestNewPointsRejectsEmptyFieldNames(t *testing.T) {
+	if _, err := models.NewPoint("foo", nil, models.Fields{"": 1}, time.Now()); err == nil {
+		t.Fatalf("new point with empty field name. got: nil, expected: error")
+	}
+}
+
+func TestNewPointsRejectsMaxKey(t *testing.T) {
+	var key string
+	for i := 0; i < 65536; i++ {
+		key += "a"
+	}
+
+	if _, err := models.NewPoint(key, nil, models.Fields{"value": 1}, time.Now()); err == nil {
+		t.Fatalf("new point with max key. got: nil, expected: error")
+	}
+
+	if _, err := models.ParsePointsString(fmt.Sprintf("%v value=1", key)); err == nil {
+		t.Fatalf("parse point with max key. got: nil, expected: error")
 	}
 }

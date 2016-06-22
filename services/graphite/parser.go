@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/influxdb/influxdb/models"
+	"github.com/influxdata/influxdb/models"
 )
 
 // Minimum and maximum supported dates for timestamps.
@@ -119,7 +119,7 @@ func (p *Parser) Parse(line string) (models.Point, error) {
 	}
 
 	if math.IsNaN(v) || math.IsInf(v, 0) {
-		return nil, &UnsupposedValueError{Field: fields[0], Value: v}
+		return nil, &UnsupportedValueError{Field: fields[0], Value: v}
 	}
 
 	fieldValues := map[string]interface{}{}
@@ -215,14 +215,28 @@ func NewTemplate(pattern string, defaultTags models.Tags, separator string) (*te
 func (t *template) Apply(line string) (string, map[string]string, string, error) {
 	fields := strings.Split(line, ".")
 	var (
-		measurement []string
-		tags        = make(map[string]string)
-		field       string
+		measurement            []string
+		tags                   = make(map[string][]string)
+		field                  string
+		hasFieldWildcard       = false
+		hasMeasurementWildcard = false
 	)
 
 	// Set any default tags
 	for k, v := range t.defaultTags {
-		tags[k] = v
+		tags[k] = append(tags[k], v)
+	}
+
+	// See if an invalid combination has been specified in the template:
+	for _, tag := range t.tags {
+		if tag == "measurement*" {
+			hasMeasurementWildcard = true
+		} else if tag == "field*" {
+			hasFieldWildcard = true
+		}
+	}
+	if hasFieldWildcard && hasMeasurementWildcard {
+		return "", nil, "", fmt.Errorf("either 'field*' or 'measurement*' can be used in each template (but not both together): %q", strings.Join(t.tags, t.separator))
 	}
 
 	for i, tag := range t.tags {
@@ -237,15 +251,24 @@ func (t *template) Apply(line string) (string, map[string]string, string, error)
 				return "", nil, "", fmt.Errorf("'field' can only be used once in each template: %q", line)
 			}
 			field = fields[i]
+		} else if tag == "field*" {
+			field = strings.Join(fields[i:], t.separator)
+			break
 		} else if tag == "measurement*" {
 			measurement = append(measurement, fields[i:]...)
 			break
 		} else if tag != "" {
-			tags[tag] = fields[i]
+			tags[tag] = append(tags[tag], fields[i])
 		}
 	}
 
-	return strings.Join(measurement, t.separator), tags, field, nil
+	// Convert to map of strings.
+	out_tags := make(map[string]string)
+	for k, values := range tags {
+		out_tags[k] = strings.Join(values, t.separator)
+	}
+
+	return strings.Join(measurement, t.separator), out_tags, field, nil
 }
 
 // matcher determines which template should be applied to a given metric
@@ -312,6 +335,11 @@ func (n *node) insert(values []string, template *template) {
 	newNode := &node{value: values[0]}
 	n.children = append(n.children, newNode)
 	sort.Sort(&n.children)
+
+	// Inherit template if value is wildcard
+	if values[0] == "*" {
+		newNode.template = n.template
+	}
 
 	// Now insert the rest of the tree into the new element
 	newNode.insert(values[1:], template)

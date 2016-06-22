@@ -14,9 +14,9 @@ func Test_StringEncoder_NoValues(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	dec, err := NewStringDecoder(b)
-	if err != nil {
-		t.Fatalf("unexpected erorr creating string decoder: %v", err)
+	var dec StringDecoder
+	if err := dec.SetBytes(b); err != nil {
+		t.Fatalf("unexpected error creating string decoder: %v", err)
 	}
 	if dec.Next() {
 		t.Fatalf("unexpected next value: got true, exp false")
@@ -32,9 +32,9 @@ func Test_StringEncoder_Single(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	dec, err := NewStringDecoder(b)
-	if err != nil {
-		t.Fatalf("unexpected erorr creating string decoder: %v", err)
+	var dec StringDecoder
+	if dec.SetBytes(b); err != nil {
+		t.Fatalf("unexpected error creating string decoder: %v", err)
 	}
 	if !dec.Next() {
 		t.Fatalf("unexpected next value: got false, exp true")
@@ -67,8 +67,8 @@ func Test_StringEncoder_Multi_Compressed(t *testing.T) {
 		t.Fatalf("unexpected length: got %v, exp %v", len(b), exp)
 	}
 
-	dec, err := NewStringDecoder(b)
-	if err != nil {
+	var dec StringDecoder
+	if err := dec.SetBytes(b); err != nil {
 		t.Fatalf("unexpected erorr creating string decoder: %v", err)
 	}
 
@@ -88,6 +88,10 @@ func Test_StringEncoder_Multi_Compressed(t *testing.T) {
 
 func Test_StringEncoder_Quick(t *testing.T) {
 	quick.Check(func(values []string) bool {
+		expected := values
+		if values == nil {
+			expected = []string{}
+		}
 		// Write values to encoder.
 		enc := NewStringEncoder()
 		for _, v := range values {
@@ -102,8 +106,8 @@ func Test_StringEncoder_Quick(t *testing.T) {
 
 		// Read values out of decoder.
 		got := make([]string, 0, len(values))
-		dec, err := NewStringDecoder(buf)
-		if err != nil {
+		var dec StringDecoder
+		if err := dec.SetBytes(buf); err != nil {
 			t.Fatal(err)
 		}
 		for dec.Next() {
@@ -114,8 +118,8 @@ func Test_StringEncoder_Quick(t *testing.T) {
 		}
 
 		// Verify that input and output values match.
-		if !reflect.DeepEqual(values, got) {
-			t.Fatalf("mismatch:\n\nexp=%+v\n\ngot=%+v\n\n", values, got)
+		if !reflect.DeepEqual(expected, got) {
+			t.Fatalf("mismatch:\n\nexp=%#v\n\ngot=%#v\n\n", expected, got)
 		}
 
 		return true

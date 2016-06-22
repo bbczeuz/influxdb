@@ -41,7 +41,7 @@ func init() {
 			&Query{
 				name:    "create database with retention replication should error with bad retention replication number",
 				command: `CREATE DATABASE db0 WITH REPLICATION xyz`,
-				exp:     `{"error":"error parsing query: found xyz, expected number at line 1, char 38"}`,
+				exp:     `{"error":"error parsing query: found xyz, expected integer at line 1, char 38"}`,
 			},
 			&Query{
 				name:    "create database with retention name should error with missing retention name",
@@ -54,29 +54,19 @@ func init() {
 				exp:     `{"results":[{"series":[{"name":"databases","columns":["name"],"values":[["db0"],["db0_r"]]}]}]}`,
 			},
 			&Query{
-				name:    "create database should error if it already exists",
-				command: `CREATE DATABASE db0`,
-				exp:     `{"results":[{"error":"database already exists"}]}`,
-			},
-			&Query{
-				name:    "create database should error if it already exists",
-				command: `CREATE DATABASE db0_r`,
-				exp:     `{"results":[{"error":"database already exists"}]}`,
-			},
-			&Query{
 				name:    "create database should not error with existing database with IF NOT EXISTS",
 				command: `CREATE DATABASE IF NOT EXISTS db0`,
-				exp:     `{"results":[{}]}`,
+				exp:     `{"results":[{"messages":[{"level":"warning","text":"IF NOT EXISTS is deprecated as of v0.13.0 and will be removed in a future release"}]}]}`,
 			},
 			&Query{
 				name:    "create database should create non-existing database with IF NOT EXISTS",
 				command: `CREATE DATABASE IF NOT EXISTS db1`,
-				exp:     `{"results":[{}]}`,
+				exp:     `{"results":[{"messages":[{"level":"warning","text":"IF NOT EXISTS is deprecated as of v0.13.0 and will be removed in a future release"}]}]}`,
 			},
 			&Query{
-				name:    "create database with retention duration should not error with existing database with IF NOT EXISTS",
+				name:    "create database with retention duration should error if retention policy is different with IF NOT EXISTS",
 				command: `CREATE DATABASE IF NOT EXISTS db1 WITH DURATION 24h`,
-				exp:     `{"results":[{}]}`,
+				exp:     `{"results":[{"error":"retention policy conflicts with an existing policy"}]}`,
 			},
 			&Query{
 				name:    "create database should error IF NOT EXISTS with bad retention duration",
@@ -107,14 +97,14 @@ func init() {
 				once:    true,
 			},
 			&Query{
-				name:    "drop database should error if it does not exists",
+				name:    "drop database should not error if it does not exists",
 				command: `DROP DATABASE db1`,
-				exp:     `{"results":[{"error":"database not found: db1"}]}`,
+				exp:     `{"results":[{}]}`,
 			},
 			&Query{
 				name:    "drop database should not error with non-existing database db1 WITH IF EXISTS",
 				command: `DROP DATABASE IF EXISTS db1`,
-				exp:     `{"results":[{}]}`,
+				exp:     `{"results":[{"messages":[{"level":"warning","text":"IF EXISTS is deprecated as of v0.13.0 and will be removed in a future release"}]}]}`,
 			},
 			&Query{
 				name:    "show database should have no results",
@@ -122,9 +112,14 @@ func init() {
 				exp:     `{"results":[{"series":[{"name":"databases","columns":["name"]}]}]}`,
 			},
 			&Query{
-				name:    "drop database should error if it doesn't exist",
-				command: `DROP DATABASE db0`,
-				exp:     `{"results":[{"error":"database not found: db0"}]}`,
+				name:    "create database with shard group duration should succeed",
+				command: `CREATE DATABASE db0 WITH SHARD DURATION 61m`,
+				exp:     `{"results":[{}]}`,
+			},
+			&Query{
+				name:    "create database with shard group duration and duration should succeed",
+				command: `CREATE DATABASE db1 WITH DURATION 60m SHARD DURATION 30m`,
+				exp:     `{"results":[{}]}`,
 			},
 		},
 	}
@@ -209,6 +204,50 @@ func init() {
 		},
 	}
 
+	tests["delete_series"] = Test{
+		db: "db0",
+		rp: "rp0",
+		writes: Writes{
+			&Write{data: fmt.Sprintf(`cpu,host=serverA,region=uswest val=23.2 %d`, mustParseTime(time.RFC3339Nano, "2000-01-01T00:00:00Z").UnixNano())},
+			&Write{data: fmt.Sprintf(`cpu,host=serverA,region=uswest val=100 %d`, mustParseTime(time.RFC3339Nano, "2000-01-02T00:00:00Z").UnixNano())},
+			&Write{data: fmt.Sprintf(`cpu,host=serverA,region=uswest val=200 %d`, mustParseTime(time.RFC3339Nano, "2000-01-03T00:00:00Z").UnixNano())},
+			&Write{db: "db1", data: fmt.Sprintf(`cpu,host=serverA,region=uswest val=23.2 %d`, mustParseTime(time.RFC3339Nano, "2000-01-01T00:00:00Z").UnixNano())},
+		},
+		queries: []*Query{
+			&Query{
+				name:    "Show series is present",
+				command: `SHOW SERIES`,
+				exp:     `{"results":[{"series":[{"columns":["key"],"values":[["cpu,host=serverA,region=uswest"]]}]}]}`,
+				params:  url.Values{"db": []string{"db0"}},
+			},
+			&Query{
+				name:    "Delete series",
+				command: `DELETE FROM cpu WHERE time < '2000-01-03T00:00:00Z'`,
+				exp:     `{"results":[{}]}`,
+				params:  url.Values{"db": []string{"db0"}},
+				once:    true,
+			},
+			&Query{
+				name:    "Show series still exists",
+				command: `SHOW SERIES`,
+				exp:     `{"results":[{"series":[{"columns":["key"],"values":[["cpu,host=serverA,region=uswest"]]}]}]}`,
+				params:  url.Values{"db": []string{"db0"}},
+			},
+			&Query{
+				name:    "Make sure last point still exists",
+				command: `SELECT * FROM cpu`,
+				exp:     `{"results":[{"series":[{"name":"cpu","columns":["time","host","region","val"],"values":[["2000-01-03T00:00:00Z","serverA","uswest",200]]}]}]}`,
+				params:  url.Values{"db": []string{"db0"}},
+			},
+			&Query{
+				name:    "Make sure data wasn't deleted from other database.",
+				command: `SELECT * FROM cpu`,
+				exp:     `{"results":[{"series":[{"name":"cpu","columns":["time","host","region","val"],"values":[["2000-01-01T00:00:00Z","serverA","uswest",23.2]]}]}]}`,
+				params:  url.Values{"db": []string{"db1"}},
+			},
+		},
+	}
+
 	tests["drop_and_recreate_series"] = Test{
 		db: "db0",
 		rp: "rp0",
@@ -220,7 +259,7 @@ func init() {
 			&Query{
 				name:    "Show series is present",
 				command: `SHOW SERIES`,
-				exp:     `{"results":[{"series":[{"name":"cpu","columns":["_key","host","region"],"values":[["cpu,host=serverA,region=uswest","serverA","uswest"]]}]}]}`,
+				exp:     `{"results":[{"series":[{"columns":["key"],"values":[["cpu,host=serverA,region=uswest"]]}]}]}`,
 				params:  url.Values{"db": []string{"db0"}},
 			},
 			&Query{
@@ -254,7 +293,7 @@ func init() {
 			&Query{
 				name:    "Show series is present again after re-write",
 				command: `SHOW SERIES`,
-				exp:     `{"results":[{"series":[{"name":"cpu","columns":["_key","host","region"],"values":[["cpu,host=serverA,region=uswest","serverA","uswest"]]}]}]}`,
+				exp:     `{"results":[{"series":[{"columns":["key"],"values":[["cpu,host=serverA,region=uswest"]]}]}]}`,
 				params:  url.Values{"db": []string{"db0"}},
 			},
 		},
@@ -275,7 +314,7 @@ func init() {
 			&Query{
 				name:    "Show series is present",
 				command: `SHOW SERIES`,
-				exp:     `{"results":[{"series":[{"name":"a","columns":["_key","host","region"],"values":[["a,host=serverA,region=uswest","serverA","uswest"]]},{"name":"aa","columns":["_key","host","region"],"values":[["aa,host=serverA,region=uswest","serverA","uswest"]]},{"name":"b","columns":["_key","host","region"],"values":[["b,host=serverA,region=uswest","serverA","uswest"]]},{"name":"c","columns":["_key","host","region"],"values":[["c,host=serverA,region=uswest","serverA","uswest"]]}]}]}`,
+				exp:     `{"results":[{"series":[{"columns":["key"],"values":[["a,host=serverA,region=uswest"],["aa,host=serverA,region=uswest"],["b,host=serverA,region=uswest"],["c,host=serverA,region=uswest"]]}]}]}`,
 				params:  url.Values{"db": []string{"db0"}},
 			},
 			&Query{
@@ -288,7 +327,7 @@ func init() {
 			&Query{
 				name:    "Show series is gone",
 				command: `SHOW SERIES`,
-				exp:     `{"results":[{"series":[{"name":"b","columns":["_key","host","region"],"values":[["b,host=serverA,region=uswest","serverA","uswest"]]},{"name":"c","columns":["_key","host","region"],"values":[["c,host=serverA,region=uswest","serverA","uswest"]]}]}]}`,
+				exp:     `{"results":[{"series":[{"columns":["key"],"values":[["b,host=serverA,region=uswest"],["c,host=serverA,region=uswest"]]}]}]}`,
 				params:  url.Values{"db": []string{"db0"}},
 			},
 			&Query{
@@ -301,19 +340,19 @@ func init() {
 			&Query{
 				name:    "make sure DROP SERIES doesn't delete anything when regex doesn't match",
 				command: `SHOW SERIES`,
-				exp:     `{"results":[{"series":[{"name":"b","columns":["_key","host","region"],"values":[["b,host=serverA,region=uswest","serverA","uswest"]]},{"name":"c","columns":["_key","host","region"],"values":[["c,host=serverA,region=uswest","serverA","uswest"]]}]}]}`,
+				exp:     `{"results":[{"series":[{"columns":["key"],"values":[["b,host=serverA,region=uswest"],["c,host=serverA,region=uswest"]]}]}]}`,
 				params:  url.Values{"db": []string{"db0"}},
 			},
 			&Query{
 				name:    "Drop series with WHERE field should error",
 				command: `DROP SERIES FROM c WHERE val > 50.0`,
-				exp:     `{"results":[{"error":"DROP SERIES doesn't support fields in WHERE clause"}]}`,
+				exp:     `{"results":[{"error":"fields not supported in WHERE clause during deletion"}]}`,
 				params:  url.Values{"db": []string{"db0"}},
 			},
 			&Query{
 				name:    "make sure DROP SERIES with field in WHERE didn't delete data",
 				command: `SHOW SERIES`,
-				exp:     `{"results":[{"series":[{"name":"b","columns":["_key","host","region"],"values":[["b,host=serverA,region=uswest","serverA","uswest"]]},{"name":"c","columns":["_key","host","region"],"values":[["c,host=serverA,region=uswest","serverA","uswest"]]}]}]}`,
+				exp:     `{"results":[{"series":[{"columns":["key"],"values":[["b,host=serverA,region=uswest"],["c,host=serverA,region=uswest"]]}]}]}`,
 				params:  url.Values{"db": []string{"db0"}},
 			},
 			&Query{
@@ -335,14 +374,9 @@ func init() {
 				once:    true,
 			},
 			&Query{
-				name:    "create retention policy should error if it already exists",
-				command: `CREATE RETENTION POLICY rp0 ON db0 DURATION 1h REPLICATION 1`,
-				exp:     `{"results":[{"error":"retention policy already exists"}]}`,
-			},
-			&Query{
 				name:    "show retention policy should succeed",
 				command: `SHOW RETENTION POLICIES ON db0`,
-				exp:     `{"results":[{"series":[{"columns":["name","duration","replicaN","default"],"values":[["rp0","1h0m0s",1,false]]}]}]}`,
+				exp:     `{"results":[{"series":[{"columns":["name","duration","shardGroupDuration","replicaN","default"],"values":[["rp0","1h0m0s","1h0m0s",1,false]]}]}]}`,
 			},
 			&Query{
 				name:    "alter retention policy should succeed",
@@ -353,17 +387,12 @@ func init() {
 			&Query{
 				name:    "show retention policy should have new altered information",
 				command: `SHOW RETENTION POLICIES ON db0`,
-				exp:     `{"results":[{"series":[{"columns":["name","duration","replicaN","default"],"values":[["rp0","2h0m0s",3,true]]}]}]}`,
-			},
-			&Query{
-				name:    "dropping default retention policy should not succeed",
-				command: `DROP RETENTION POLICY rp0 ON db0`,
-				exp:     `{"results":[{"error":"retention policy is default"}]}`,
+				exp:     `{"results":[{"series":[{"columns":["name","duration","shardGroupDuration","replicaN","default"],"values":[["rp0","2h0m0s","1h0m0s",3,true]]}]}]}`,
 			},
 			&Query{
 				name:    "show retention policy should still show policy",
 				command: `SHOW RETENTION POLICIES ON db0`,
-				exp:     `{"results":[{"series":[{"columns":["name","duration","replicaN","default"],"values":[["rp0","2h0m0s",3,true]]}]}]}`,
+				exp:     `{"results":[{"series":[{"columns":["name","duration","shardGroupDuration","replicaN","default"],"values":[["rp0","2h0m0s","1h0m0s",3,true]]}]}]}`,
 			},
 			&Query{
 				name:    "create a second non-default retention policy",
@@ -374,7 +403,7 @@ func init() {
 			&Query{
 				name:    "show retention policy should show both",
 				command: `SHOW RETENTION POLICIES ON db0`,
-				exp:     `{"results":[{"series":[{"columns":["name","duration","replicaN","default"],"values":[["rp0","2h0m0s",3,true],["rp2","1h0m0s",1,false]]}]}]}`,
+				exp:     `{"results":[{"series":[{"columns":["name","duration","shardGroupDuration","replicaN","default"],"values":[["rp0","2h0m0s","1h0m0s",3,true],["rp2","1h0m0s","1h0m0s",1,false]]}]}]}`,
 			},
 			&Query{
 				name:    "dropping non-default retention policy succeed",
@@ -383,20 +412,43 @@ func init() {
 				once:    true,
 			},
 			&Query{
+				name:    "create a third non-default retention policy",
+				command: `CREATE RETENTION POLICY rp3 ON db0 DURATION 1h REPLICATION 1 SHARD DURATION 30m`,
+				exp:     `{"results":[{}]}`,
+				once:    true,
+			},
+			&Query{
+				name:    "show retention policy should show both with custom shard",
+				command: `SHOW RETENTION POLICIES ON db0`,
+				exp:     `{"results":[{"series":[{"columns":["name","duration","shardGroupDuration","replicaN","default"],"values":[["rp0","2h0m0s","1h0m0s",3,true],["rp3","1h0m0s","30m0s",1,false]]}]}]}`,
+			},
+			&Query{
+				name:    "dropping non-default custom shard retention policy succeed",
+				command: `DROP RETENTION POLICY rp3 ON db0`,
+				exp:     `{"results":[{}]}`,
+				once:    true,
+			},
+			&Query{
 				name:    "show retention policy should show just default",
 				command: `SHOW RETENTION POLICIES ON db0`,
-				exp:     `{"results":[{"series":[{"columns":["name","duration","replicaN","default"],"values":[["rp0","2h0m0s",3,true]]}]}]}`,
+				exp:     `{"results":[{"series":[{"columns":["name","duration","shardGroupDuration","replicaN","default"],"values":[["rp0","2h0m0s","1h0m0s",3,true]]}]}]}`,
 			},
 			&Query{
 				name:    "Ensure retention policy with unacceptable retention cannot be created",
-				command: `CREATE RETENTION POLICY rp3 ON db0 DURATION 1s REPLICATION 1`,
+				command: `CREATE RETENTION POLICY rp4 ON db0 DURATION 1s REPLICATION 1`,
 				exp:     `{"results":[{"error":"retention policy duration must be at least 1h0m0s"}]}`,
 				once:    true,
 			},
 			&Query{
 				name:    "Check error when deleting retention policy on non-existent database",
 				command: `DROP RETENTION POLICY rp1 ON mydatabase`,
-				exp:     `{"results":[{"error":"database not found: mydatabase"}]}`,
+				exp:     `{"results":[{}]}`,
+			},
+			&Query{
+				name:    "Ensure retention policy for non existing db is not created",
+				command: `CREATE RETENTION POLICY rp0 ON nodb DURATION 1h REPLICATION 1`,
+				exp:     `{"results":[{"error":"database not found: nodb"}]}`,
+				once:    true,
 			},
 		},
 	}
@@ -412,7 +464,7 @@ func init() {
 			&Query{
 				name:    "show retention policies should return auto-created policy",
 				command: `SHOW RETENTION POLICIES ON db0`,
-				exp:     `{"results":[{"series":[{"columns":["name","duration","replicaN","default"],"values":[["default","0",1,true]]}]}]}`,
+				exp:     `{"results":[{"series":[{"columns":["name","duration","shardGroupDuration","replicaN","default"],"values":[["autogen","0","168h0m0s",1,true]]}]}]}`,
 			},
 		},
 	}

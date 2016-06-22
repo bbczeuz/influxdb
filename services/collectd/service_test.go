@@ -9,10 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/influxdb/influxdb/cluster"
-	"github.com/influxdb/influxdb/meta"
-	"github.com/influxdb/influxdb/models"
-	"github.com/influxdb/influxdb/toml"
+	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/services/meta"
+	"github.com/influxdata/influxdb/toml"
 )
 
 // Test that the service checks / creates the target database on startup.
@@ -23,7 +22,7 @@ func TestService_CreatesDatabase(t *testing.T) {
 
 	createDatabaseCalled := false
 
-	ms := &testMetaStore{}
+	ms := &testMetaClient{}
 	ms.CreateDatabaseIfNotExistsFn = func(name string) (*meta.DatabaseInfo, error) {
 		if name != s.Config.Database {
 			t.Errorf("\n\texp = %s\n\tgot = %s\n", s.Config.Database, name)
@@ -31,7 +30,7 @@ func TestService_CreatesDatabase(t *testing.T) {
 		createDatabaseCalled = true
 		return nil, nil
 	}
-	s.Service.MetaStore = ms
+	s.Service.MetaClient = ms
 
 	s.Open()
 	s.Close()
@@ -55,13 +54,13 @@ func TestService_BatchSize(t *testing.T) {
 			s := newTestService(batchSize, time.Second)
 
 			pointCh := make(chan models.Point)
-			s.MetaStore.CreateDatabaseIfNotExistsFn = func(name string) (*meta.DatabaseInfo, error) { return nil, nil }
-			s.PointsWriter.WritePointsFn = func(req *cluster.WritePointsRequest) error {
-				if len(req.Points) != batchSize {
-					t.Errorf("\n\texp = %d\n\tgot = %d\n", batchSize, len(req.Points))
+			s.MetaClient.CreateDatabaseIfNotExistsFn = func(name string) (*meta.DatabaseInfo, error) { return nil, nil }
+			s.PointsWriter.WritePointsFn = func(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, points []models.Point) error {
+				if len(points) != batchSize {
+					t.Errorf("\n\texp = %d\n\tgot = %d\n", batchSize, len(points))
 				}
 
-				for _, p := range req.Points {
+				for _, p := range points {
 					pointCh <- p
 				}
 				return nil
@@ -124,9 +123,9 @@ func TestService_BatchDuration(t *testing.T) {
 	s := newTestService(5000, 250*time.Millisecond)
 
 	pointCh := make(chan models.Point, 1000)
-	s.MetaStore.CreateDatabaseIfNotExistsFn = func(name string) (*meta.DatabaseInfo, error) { return nil, nil }
-	s.PointsWriter.WritePointsFn = func(req *cluster.WritePointsRequest) error {
-		for _, p := range req.Points {
+	s.MetaClient.CreateDatabaseIfNotExistsFn = func(name string) (*meta.DatabaseInfo, error) { return nil, nil }
+	s.PointsWriter.WritePointsFn = func(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, points []models.Point) error {
+		for _, p := range points {
 			pointCh <- p
 		}
 		return nil
@@ -180,7 +179,7 @@ Loop:
 
 type testService struct {
 	*Service
-	MetaStore    testMetaStore
+	MetaClient   testMetaClient
 	PointsWriter testPointsWriter
 }
 
@@ -194,7 +193,7 @@ func newTestService(batchSize int, batchDuration time.Duration) *testService {
 		}),
 	}
 	s.Service.PointsWriter = &s.PointsWriter
-	s.Service.MetaStore = &s.MetaStore
+	s.Service.MetaClient = &s.MetaClient
 
 	// Set the collectd types using test string.
 	if err := s.SetTypes(typesDBText); err != nil {
@@ -209,24 +208,20 @@ func newTestService(batchSize int, batchDuration time.Duration) *testService {
 }
 
 type testPointsWriter struct {
-	WritePointsFn func(*cluster.WritePointsRequest) error
+	WritePointsFn func(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, points []models.Point) error
 }
 
-func (w *testPointsWriter) WritePoints(p *cluster.WritePointsRequest) error {
-	return w.WritePointsFn(p)
+func (w *testPointsWriter) WritePoints(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, points []models.Point) error {
+	return w.WritePointsFn(database, retentionPolicy, consistencyLevel, points)
 }
 
-type testMetaStore struct {
+type testMetaClient struct {
 	CreateDatabaseIfNotExistsFn func(name string) (*meta.DatabaseInfo, error)
 	//DatabaseFn func(name string) (*meta.DatabaseInfo, error)
 }
 
-func (ms *testMetaStore) CreateDatabaseIfNotExists(name string) (*meta.DatabaseInfo, error) {
+func (ms *testMetaClient) CreateDatabase(name string) (*meta.DatabaseInfo, error) {
 	return ms.CreateDatabaseIfNotExistsFn(name)
-}
-
-func (ms *testMetaStore) WaitForLeader(d time.Duration) error {
-	return nil
 }
 
 func wait(c chan struct{}, d time.Duration) (err error) {

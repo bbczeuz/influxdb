@@ -12,19 +12,17 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/influxdb/influxdb"
-	"github.com/influxdb/influxdb/cluster"
-	"github.com/influxdb/influxdb/models"
+	"github.com/influxdata/influxdb"
+	"github.com/influxdata/influxdb/models"
 )
 
 // Handler is an http.Handler for the service.
 type Handler struct {
-	Database         string
-	RetentionPolicy  string
-	ConsistencyLevel cluster.ConsistencyLevel
+	Database        string
+	RetentionPolicy string
 
 	PointsWriter interface {
-		WritePoints(p *cluster.WritePointsRequest) error
+		WritePoints(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, points []models.Point) error
 	}
 
 	Logger *log.Logger
@@ -123,12 +121,7 @@ func (h *Handler) servePut(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Write points.
-	if err := h.PointsWriter.WritePoints(&cluster.WritePointsRequest{
-		Database:         h.Database,
-		RetentionPolicy:  h.RetentionPolicy,
-		ConsistencyLevel: h.ConsistencyLevel,
-		Points:           points,
-	}); influxdb.IsClientError(err) {
+	if err := h.PointsWriter.WritePoints(h.Database, h.RetentionPolicy, models.ConsistencyLevelAny, points); influxdb.IsClientError(err) {
 		h.Logger.Println("write series error: ", err)
 		http.Error(w, "write series error: "+err.Error(), http.StatusBadRequest)
 		return
@@ -160,7 +153,6 @@ func (ln *chanListener) Accept() (net.Conn, error) {
 	if !ok {
 		return nil, errors.New("network connection closed")
 	}
-	log.Println("TSDB listener accept ", conn)
 	return conn, nil
 }
 

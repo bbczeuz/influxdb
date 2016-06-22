@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -11,7 +10,8 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/influxdb/influxdb/tsdb"
+	"github.com/influxdata/influxdb/influxql"
+	"github.com/influxdata/influxdb/tsdb"
 )
 
 func cmdInfo(path string) {
@@ -56,15 +56,18 @@ func cmdInfo(path string) {
 			fields := m.FieldNames()
 			sort.Strings(fields)
 			series := m.SeriesKeys()
-			sort.Strings(series)
 			sort.Sort(ShardIDs(shardIDs))
 
 			// Sample a point from each measurement to determine the field types
+			sources := []influxql.Source{&influxql.Measurement{Name: m.Name}}
 			for _, shardID := range shardIDs {
 				shard := tstore.Shard(shardID)
-				codec := shard.FieldCodec(m.Name)
-				for _, field := range codec.Fields() {
-					ft := fmt.Sprintf("%s:%s", field.Name, field.Type)
+				fieldSet, _, err := shard.FieldDimensions(sources)
+				if err != nil {
+					continue
+				}
+				for _, name := range fields {
+					ft := fmt.Sprintf("%s:%s", name, fieldSet[name])
 					fmt.Fprintf(tw, "%d\t%s\t%s\t%d/%d\t%d [%s]\t%d\n", shardID, db, m.Name, len(tags), tagValues,
 						len(fields), ft, len(series))
 
@@ -88,28 +91,6 @@ func countSeries(tstore *tsdb.Store) int {
 		count += cnt
 	}
 	return count
-}
-
-func btou64(b []byte) uint64 {
-	return binary.BigEndian.Uint64(b)
-}
-
-// u64tob converts a uint64 into an 8-byte slice.
-func u64tob(v uint64) []byte {
-	b := make([]byte, 8)
-	binary.BigEndian.PutUint64(b, v)
-	return b
-}
-
-func btou32(b []byte) uint32 {
-	return binary.BigEndian.Uint32(b)
-}
-
-// u32tob converts a uint32 into an 4-byte slice.
-func u32tob(v uint32) []byte {
-	b := make([]byte, 4)
-	binary.BigEndian.PutUint32(b, v)
-	return b
 }
 
 // ShardIDs is a collection of UINT 64 that represent shard ids.

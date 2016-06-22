@@ -1,8 +1,9 @@
-package udp
+package udp // import "github.com/influxdata/influxdb/services/udp"
 
 import (
 	"errors"
 	"expvar"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -10,20 +11,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/influxdb/influxdb"
-	"github.com/influxdb/influxdb/cluster"
-	"github.com/influxdb/influxdb/meta"
-	"github.com/influxdb/influxdb/models"
-	"github.com/influxdb/influxdb/tsdb"
+	"github.com/influxdata/influxdb"
+	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/services/meta"
+	"github.com/influxdata/influxdb/tsdb"
 )
 
 const (
-	// UDPBufferSize is the maximum UDP packet size
-	// see https://en.wikipedia.org/wiki/User_Datagram_Protocol#Packet_structure
-	UDPBufferSize = 65536
-
 	// Arbitrary, testing indicated that this doesn't typically get over 10
 	parserChanLen = 1000
+
+	MAX_UDP_PAYLOAD = 64 * 1024
 )
 
 // statistics gathered by the UDP package.
@@ -53,11 +51,11 @@ type Service struct {
 	config     Config
 
 	PointsWriter interface {
-		WritePoints(p *cluster.WritePointsRequest) error
+		WritePoints(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, points []models.Point) error
 	}
 
-	MetaStore interface {
-		CreateDatabaseIfNotExists(name string) (*meta.DatabaseInfo, error)
+	MetaClient interface {
+		CreateDatabase(name string) (*meta.DatabaseInfo, error)
 	}
 
 	Logger  *log.Logger
@@ -91,7 +89,7 @@ func (s *Service) Open() (err error) {
 		return errors.New("database has to be specified in config")
 	}
 
-	if _, err := s.MetaStore.CreateDatabaseIfNotExists(s.config.Database); err != nil {
+	if _, err := s.MetaClient.CreateDatabase(s.config.Database); err != nil {
 		return errors.New("Failed to ensure target database exists")
 	}
 
@@ -132,12 +130,7 @@ func (s *Service) writer() {
 	for {
 		select {
 		case batch := <-s.batcher.Out():
-			if err := s.PointsWriter.WritePoints(&cluster.WritePointsRequest{
-				Database:         s.config.Database,
-				RetentionPolicy:  s.config.RetentionPolicy,
-				ConsistencyLevel: cluster.ConsistencyLevelOne,
-				Points:           batch,
-			}); err == nil {
+			if err := s.PointsWriter.WritePoints(s.config.Database, s.config.RetentionPolicy, models.ConsistencyLevelAny, batch); err == nil {
 				s.statMap.Add(statBatchesTrasmitted, 1)
 				s.statMap.Add(statPointsTransmitted, int64(len(batch)))
 			} else {
@@ -154,6 +147,7 @@ func (s *Service) writer() {
 func (s *Service) serve() {
 	defer s.wg.Done()
 
+	buf := make([]byte, MAX_UDP_PAYLOAD)
 	s.batcher.Start()
 	for {
 
@@ -163,7 +157,6 @@ func (s *Service) serve() {
 			return
 		default:
 			// Keep processing.
-			buf := make([]byte, UDPBufferSize)
 			n, _, err := s.conn.ReadFromUDP(buf)
 			if err != nil {
 				s.statMap.Add(statReadFail, 1)
@@ -171,7 +164,10 @@ func (s *Service) serve() {
 				continue
 			}
 			s.statMap.Add(statBytesReceived, int64(n))
-			s.parserChan <- buf[:n]
+
+			bufCopy := make([]byte, n)
+			copy(bufCopy, buf[:n])
+			s.parserChan <- bufCopy
 		}
 	}
 }
@@ -184,7 +180,7 @@ func (s *Service) parser() {
 		case <-s.done:
 			return
 		case buf := <-s.parserChan:
-			points, err := models.ParsePoints(buf)
+			points, err := models.ParsePointsWithPrecision(buf, time.Now().UTC(), s.config.Precision)
 			if err != nil {
 				s.statMap.Add(statPointsParseFail, 1)
 				s.Logger.Printf("Failed to parse points: %s", err)
@@ -219,9 +215,10 @@ func (s *Service) Close() error {
 	return nil
 }
 
-// SetLogger sets the internal logger to the logger passed in.
-func (s *Service) SetLogger(l *log.Logger) {
-	s.Logger = l
+// SetLogOutput sets the writer to which all logs are written. It must not be
+// called after Open is called.
+func (s *Service) SetLogOutput(w io.Writer) {
+	s.Logger = log.New(w, "[udp] ", log.LstdFlags)
 }
 
 // Addr returns the listener's address

@@ -2,151 +2,36 @@ package httpd_test
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/influxdb/influxdb"
-	"github.com/influxdb/influxdb/client"
-	"github.com/influxdb/influxdb/influxql"
-	"github.com/influxdb/influxdb/meta"
-	"github.com/influxdb/influxdb/models"
-	"github.com/influxdb/influxdb/services/httpd"
-	"github.com/influxdb/influxdb/tsdb"
+	"github.com/dgrijalva/jwt-go"
+	"github.com/influxdata/influxdb"
+	"github.com/influxdata/influxdb/influxql"
+	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/services/httpd"
+	"github.com/influxdata/influxdb/services/meta"
 )
-
-func TestBatchWrite_UnmarshalEpoch(t *testing.T) {
-	now := time.Now().UTC()
-	tests := []struct {
-		name      string
-		epoch     int64
-		precision string
-		expected  time.Time
-	}{
-		{
-			name:      "nanoseconds",
-			epoch:     now.UnixNano(),
-			precision: "n",
-			expected:  now,
-		},
-		{
-			name:      "microseconds",
-			epoch:     now.Round(time.Microsecond).UnixNano() / int64(time.Microsecond),
-			precision: "u",
-			expected:  now.Round(time.Microsecond),
-		},
-		{
-			name:      "milliseconds",
-			epoch:     now.Round(time.Millisecond).UnixNano() / int64(time.Millisecond),
-			precision: "ms",
-			expected:  now.Round(time.Millisecond),
-		},
-		{
-			name:      "seconds",
-			epoch:     now.Round(time.Second).UnixNano() / int64(time.Second),
-			precision: "s",
-			expected:  now.Round(time.Second),
-		},
-		{
-			name:      "minutes",
-			epoch:     now.Round(time.Minute).UnixNano() / int64(time.Minute),
-			precision: "m",
-			expected:  now.Round(time.Minute),
-		},
-		{
-			name:      "hours",
-			epoch:     now.Round(time.Hour).UnixNano() / int64(time.Hour),
-			precision: "h",
-			expected:  now.Round(time.Hour),
-		},
-		{
-			name:      "max int64",
-			epoch:     9223372036854775807,
-			precision: "n",
-			expected:  time.Unix(0, 9223372036854775807),
-		},
-		{
-			name:      "100 years from now",
-			epoch:     now.Add(time.Hour * 24 * 365 * 100).UnixNano(),
-			precision: "n",
-			expected:  now.Add(time.Hour * 24 * 365 * 100),
-		},
-	}
-
-	for _, test := range tests {
-		t.Logf("testing %q\n", test.name)
-		data := []byte(fmt.Sprintf(`{"time": %d, "precision":"%s"}`, test.epoch, test.precision))
-		t.Logf("json: %s", string(data))
-		var bp client.BatchPoints
-		err := json.Unmarshal(data, &bp)
-		if err != nil {
-			t.Fatalf("unexpected error.  expected: %v, actual: %v", nil, err)
-		}
-		if !bp.Time.Equal(test.expected) {
-			t.Fatalf("Unexpected time.  expected: %v, actual: %v", test.expected, bp.Time)
-		}
-	}
-}
-
-func TestBatchWrite_UnmarshalRFC(t *testing.T) {
-	now := time.Now()
-	tests := []struct {
-		name     string
-		rfc      string
-		now      time.Time
-		expected time.Time
-	}{
-		{
-			name:     "RFC3339Nano",
-			rfc:      time.RFC3339Nano,
-			now:      now,
-			expected: now,
-		},
-		{
-			name:     "RFC3339",
-			rfc:      time.RFC3339,
-			now:      now.Round(time.Second),
-			expected: now.Round(time.Second),
-		},
-	}
-
-	for _, test := range tests {
-		t.Logf("testing %q\n", test.name)
-		ts := test.now.Format(test.rfc)
-		data := []byte(fmt.Sprintf(`{"time": %q}`, ts))
-		t.Logf("json: %s", string(data))
-		var bp client.BatchPoints
-		err := json.Unmarshal(data, &bp)
-		if err != nil {
-			t.Fatalf("unexpected error.  exptected: %v, actual: %v", nil, err)
-		}
-		if !bp.Time.Equal(test.expected) {
-			t.Fatalf("Unexpected time.  expected: %v, actual: %v", test.expected, bp.Time)
-		}
-	}
-}
 
 // Ensure the handler returns results from a query (including nil results).
 func TestHandler_Query(t *testing.T) {
 	h := NewHandler(false)
-	h.QueryExecutor.ExecuteQueryFn = func(q *influxql.Query, db string, chunkSize int, closing chan struct{}) (<-chan *influxql.Result, error) {
-		if q.String() != `SELECT * FROM bar` {
-			t.Fatalf("unexpected query: %s", q.String())
-		} else if db != `foo` {
-			t.Fatalf("unexpected db: %s", db)
+	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
+		if stmt.String() != `SELECT * FROM bar` {
+			t.Fatalf("unexpected query: %s", stmt.String())
+		} else if ctx.Database != `foo` {
+			t.Fatalf("unexpected db: %s", ctx.Database)
 		}
-		return NewResultChan(
-			&influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series0"}})},
-			&influxql.Result{StatementID: 2, Series: models.Rows([]*models.Row{{Name: "series1"}})},
-			nil,
-		), nil
+		ctx.Results <- &influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series0"}})}
+		ctx.Results <- &influxql.Result{StatementID: 2, Series: models.Rows([]*models.Row{{Name: "series1"}})}
+		return nil
 	}
 
 	w := httptest.NewRecorder()
@@ -158,18 +43,149 @@ func TestHandler_Query(t *testing.T) {
 	}
 }
 
+// Test query with user authentication.
+func TestHandler_Query_Auth(t *testing.T) {
+	// Create the handler to be tested.
+	h := NewHandler(true)
+
+	// Set mock meta client functions for the handler to use.
+	h.MetaClient.UsersFn = func() []meta.UserInfo {
+		return []meta.UserInfo{
+			{
+				Name:       "user1",
+				Hash:       "abcd",
+				Admin:      true,
+				Privileges: make(map[string]influxql.Privilege),
+			},
+		}
+	}
+
+	h.MetaClient.UserFn = func(username string) (*meta.UserInfo, error) {
+		if username != "user1" {
+			return nil, meta.ErrUserNotFound
+		}
+		return &meta.UserInfo{
+			Name:  "user1",
+			Hash:  "abcd",
+			Admin: true,
+		}, nil
+	}
+
+	h.MetaClient.AuthenticateFn = func(u, p string) (*meta.UserInfo, error) {
+		if u != "user1" {
+			return nil, fmt.Errorf("unexpected user: exp: user1, got: %s", u)
+		} else if p != "abcd" {
+			return nil, fmt.Errorf("unexpected password: exp: abcd, got: %s", p)
+		}
+		return h.MetaClient.User(u)
+	}
+
+	// Set mock query authorizer for handler to use.
+	h.QueryAuthorizer.AuthorizeQueryFn = func(u *meta.UserInfo, query *influxql.Query, database string) error {
+		return nil
+	}
+
+	// Set mock statement executor for handler to use.
+	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
+		if stmt.String() != `SELECT * FROM bar` {
+			t.Fatalf("unexpected query: %s", stmt.String())
+		} else if ctx.Database != `foo` {
+			t.Fatalf("unexpected db: %s", ctx.Database)
+		}
+		ctx.Results <- &influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series0"}})}
+		ctx.Results <- &influxql.Result{StatementID: 2, Series: models.Rows([]*models.Row{{Name: "series1"}})}
+		return nil
+	}
+
+	// Test the handler with valid user and password in the URL parameters.
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, MustNewJSONRequest("GET", "/query?u=user1&p=abcd&db=foo&q=SELECT+*+FROM+bar", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d: %s", w.Code, w.Body.String())
+	} else if w.Body.String() != `{"results":[{"series":[{"name":"series0"}]},{"series":[{"name":"series1"}]}]}` {
+		t.Fatalf("unexpected body: %s", w.Body.String())
+	}
+
+	// Test the handler with valid JWT bearer token.
+	req := MustNewJSONRequest("GET", "/query?db=foo&q=SELECT+*+FROM+bar", nil)
+	// Create a signed JWT token string and add it to the request header.
+	_, signedToken := MustJWTToken("user1", h.Config.SharedSecret, false)
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", signedToken))
+
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d: %s", w.Code, w.Body.String())
+	} else if w.Body.String() != `{"results":[{"series":[{"name":"series0"}]},{"series":[{"name":"series1"}]}]}` {
+		t.Fatalf("unexpected body: %s", w.Body.String())
+	}
+
+	// Test the handler with JWT token signed with invalid key.
+	req = MustNewJSONRequest("GET", "/query?db=foo&q=SELECT+*+FROM+bar", nil)
+	// Create a signed JWT token string and add it to the request header.
+	_, signedToken = MustJWTToken("user1", "invalid key", false)
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", signedToken))
+
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("unexpected status: %d: %s", w.Code, w.Body.String())
+	} else if w.Body.String() != `{"error":"signature is invalid"}` {
+		t.Fatalf("unexpected body: %s", w.Body.String())
+	}
+
+	// Test handler with valid JWT token carrying non-existant user.
+	_, signedToken = MustJWTToken("bad_user", h.Config.SharedSecret, false)
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", signedToken))
+
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("unexpected status: %d: %s", w.Code, w.Body.String())
+	} else if w.Body.String() != `{"error":"user not found"}` {
+		t.Fatalf("unexpected body: %s", w.Body.String())
+	}
+
+	// Test handler with expired JWT token.
+	_, signedToken = MustJWTToken("user1", h.Config.SharedSecret, true)
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", signedToken))
+
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("unexpected status: %d: %s", w.Code, w.Body.String())
+	} else if !strings.Contains(w.Body.String(), `{"error":"token is expired`) {
+		t.Fatalf("unexpected body: %s", w.Body.String())
+	}
+
+	// Test handler with JWT token that has no expiration set.
+	token, _ := MustJWTToken("user1", h.Config.SharedSecret, false)
+	delete(token.Claims, "exp")
+	signedToken, err := token.SignedString([]byte(h.Config.SharedSecret))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", signedToken))
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("unexpected status: %d: %s", w.Code, w.Body.String())
+	} else if w.Body.String() != `{"error":"token expiration required"}` {
+		t.Fatalf("unexpected body: %s", w.Body.String())
+	}
+}
+
 // Ensure the handler returns results from a query (including nil results).
 func TestHandler_QueryRegex(t *testing.T) {
 	h := NewHandler(false)
-	h.QueryExecutor.ExecuteQueryFn = func(q *influxql.Query, db string, chunkSize int, closing chan struct{}) (<-chan *influxql.Result, error) {
-		if q.String() != `SELECT * FROM test WHERE url =~ /http\:\/\/www.akamai\.com/` {
-			t.Fatalf("unexpected query: %s", q.String())
-		} else if db != `test` {
-			t.Fatalf("unexpected db: %s", db)
+	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
+		if stmt.String() != `SELECT * FROM test WHERE url =~ /http\:\/\/www.akamai\.com/` {
+			t.Fatalf("unexpected query: %s", stmt.String())
+		} else if ctx.Database != `test` {
+			t.Fatalf("unexpected db: %s", ctx.Database)
 		}
-		return NewResultChan(
-			nil,
-		), nil
+		ctx.Results <- nil
+		return nil
 	}
 
 	w := httptest.NewRecorder()
@@ -179,11 +195,10 @@ func TestHandler_QueryRegex(t *testing.T) {
 // Ensure the handler merges results from the same statement.
 func TestHandler_Query_MergeResults(t *testing.T) {
 	h := NewHandler(false)
-	h.QueryExecutor.ExecuteQueryFn = func(q *influxql.Query, db string, chunkSize int, closing chan struct{}) (<-chan *influxql.Result, error) {
-		return NewResultChan(
-			&influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series0"}})},
-			&influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series1"}})},
-		), nil
+	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
+		ctx.Results <- &influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series0"}})}
+		ctx.Results <- &influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series1"}})}
+		return nil
 	}
 
 	w := httptest.NewRecorder()
@@ -198,11 +213,10 @@ func TestHandler_Query_MergeResults(t *testing.T) {
 // Ensure the handler merges results from the same statement.
 func TestHandler_Query_MergeEmptyResults(t *testing.T) {
 	h := NewHandler(false)
-	h.QueryExecutor.ExecuteQueryFn = func(q *influxql.Query, db string, chunkSize int, closing chan struct{}) (<-chan *influxql.Result, error) {
-		return NewResultChan(
-			&influxql.Result{StatementID: 1, Series: models.Rows{}},
-			&influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series1"}})},
-		), nil
+	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
+		ctx.Results <- &influxql.Result{StatementID: 1, Series: models.Rows{}}
+		ctx.Results <- &influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series1"}})}
+		return nil
 	}
 
 	w := httptest.NewRecorder()
@@ -217,21 +231,22 @@ func TestHandler_Query_MergeEmptyResults(t *testing.T) {
 // Ensure the handler can parse chunked and chunk size query parameters.
 func TestHandler_Query_Chunked(t *testing.T) {
 	h := NewHandler(false)
-	h.QueryExecutor.ExecuteQueryFn = func(q *influxql.Query, db string, chunkSize int, closing chan struct{}) (<-chan *influxql.Result, error) {
-		if chunkSize != 2 {
-			t.Fatalf("unexpected chunk size: %d", chunkSize)
+	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
+		if ctx.ChunkSize != 2 {
+			t.Fatalf("unexpected chunk size: %d", ctx.ChunkSize)
 		}
-		return NewResultChan(
-			&influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series0"}})},
-			&influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series1"}})},
-		), nil
+		ctx.Results <- &influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series0"}})}
+		ctx.Results <- &influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series1"}})}
+		return nil
 	}
 
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, MustNewJSONRequest("GET", "/query?db=foo&q=SELECT+*+FROM+bar&chunked=true&chunk_size=2", nil))
 	if w.Code != http.StatusOK {
 		t.Fatalf("unexpected status: %d", w.Code)
-	} else if w.Body.String() != `{"results":[{"series":[{"name":"series0"}]}]}{"results":[{"series":[{"name":"series1"}]}]}` {
+	} else if w.Body.String() != `{"results":[{"series":[{"name":"series0"}]}]}
+{"results":[{"series":[{"name":"series1"}]}]}
+` {
 		t.Fatalf("unexpected body: %s", w.Body.String())
 	}
 }
@@ -274,25 +289,11 @@ func TestHandler_Query_ErrInvalidQuery(t *testing.T) {
 // 	}
 // }
 
-// Ensure the handler returns a status 500 if an error is returned from the query executor.
-func TestHandler_Query_ErrExecuteQuery(t *testing.T) {
-	h := NewHandler(false)
-	h.QueryExecutor.ExecuteQueryFn = func(q *influxql.Query, db string, chunkSize int, closing chan struct{}) (<-chan *influxql.Result, error) {
-		return nil, errors.New("marker")
-	}
-
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, MustNewJSONRequest("GET", "/query?db=foo&q=SHOW+SERIES+FROM+bar", nil))
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("unexpected status: %d", w.Code)
-	}
-}
-
 // Ensure the handler returns a status 200 if an error is returned in the result.
 func TestHandler_Query_ErrResult(t *testing.T) {
 	h := NewHandler(false)
-	h.QueryExecutor.ExecuteQueryFn = func(q *influxql.Query, db string, chunkSize int, closing chan struct{}) (<-chan *influxql.Result, error) {
-		return NewResultChan(&influxql.Result{Err: errors.New("measurement not found")}), nil
+	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
+		return errors.New("measurement not found")
 	}
 
 	w := httptest.NewRecorder()
@@ -305,6 +306,7 @@ func TestHandler_Query_ErrResult(t *testing.T) {
 }
 
 // Ensure the handler handles ping requests correctly.
+// TODO: This should be expanded to verify the MetaClient check in servePing is working correctly
 func TestHandler_Ping(t *testing.T) {
 	h := NewHandler(false)
 	w := httptest.NewRecorder()
@@ -318,47 +320,62 @@ func TestHandler_Ping(t *testing.T) {
 	}
 }
 
-// Ensure the handler handles ping requests correctly, when waiting for leader.
-func TestHandler_PingWaitForLeader(t *testing.T) {
+// Ensure the handler returns the version correctly from the different endpoints.
+func TestHandler_Version(t *testing.T) {
 	h := NewHandler(false)
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, MustNewRequest("GET", "/ping?wait_for_leader=1s", nil))
-	if w.Code != http.StatusNoContent {
-		t.Fatalf("unexpected status: %d", w.Code)
+	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
+		return nil
 	}
-	h.ServeHTTP(w, MustNewRequest("HEAD", "/ping?wait_for_leader=1s", nil))
-	if w.Code != http.StatusNoContent {
-		t.Fatalf("unexpected status: %d", w.Code)
+	tests := []struct {
+		method   string
+		endpoint string
+		body     io.Reader
+	}{
+		{
+			method:   "GET",
+			endpoint: "/ping",
+			body:     nil,
+		},
+		{
+			method:   "GET",
+			endpoint: "/query?db=foo&q=SELECT+*+FROM+bar",
+			body:     nil,
+		},
+		{
+			method:   "POST",
+			endpoint: "/write",
+			body:     bytes.NewReader(make([]byte, 10)),
+		},
+		{
+			method:   "GET",
+			endpoint: "/notfound",
+			body:     nil,
+		},
+	}
+
+	for _, test := range tests {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, MustNewRequest(test.method, test.endpoint, test.body))
+		if v, ok := w.HeaderMap["X-Influxdb-Version"]; ok {
+			if v[0] != "0.0.0" {
+				t.Fatalf("unexpected version: %s", v)
+			}
+		} else {
+			t.Fatalf("Header entry 'X-Influxdb-Version' not present")
+		}
 	}
 }
 
-// Ensure the handler handles ping requests correctly, when timeout expires waiting for leader.
-func TestHandler_PingWaitForLeaderTimeout(t *testing.T) {
-	h := NewHandler(false)
-	h.MetaStore.WaitForLeaderFn = func(d time.Duration) error {
-		return fmt.Errorf("timeout")
-	}
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, MustNewRequest("GET", "/ping?wait_for_leader=1s", nil))
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("unexpected status: %d", w.Code)
-	}
-	h.ServeHTTP(w, MustNewRequest("HEAD", "/ping?wait_for_leader=1s", nil))
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("unexpected status: %d", w.Code)
-	}
-}
-
-// Ensure the handler handles bad ping requests
-func TestHandler_PingWaitForLeaderBadRequest(t *testing.T) {
+// Ensure the handler handles status requests correctly.
+func TestHandler_Status(t *testing.T) {
 	h := NewHandler(false)
 	w := httptest.NewRecorder()
-	h.ServeHTTP(w, MustNewRequest("GET", "/ping?wait_for_leader=1xxx", nil))
-	if w.Code != http.StatusBadRequest {
+	h.ServeHTTP(w, MustNewRequest("GET", "/status", nil))
+	if w.Code != http.StatusNoContent {
 		t.Fatalf("unexpected status: %d", w.Code)
 	}
-	h.ServeHTTP(w, MustNewRequest("HEAD", "/ping?wait_for_leader=abc", nil))
-	if w.Code != http.StatusBadRequest {
+	h.ServeHTTP(w, MustNewRequest("HEAD", "/status", nil))
+	if w.Code != http.StatusNoContent {
 		t.Fatalf("unexpected status: %d", w.Code)
 	}
 }
@@ -400,108 +417,51 @@ type invalidJSON struct{}
 
 func (*invalidJSON) MarshalJSON() ([]byte, error) { return nil, errors.New("marker") }
 
-func TestNormalizeBatchPoints(t *testing.T) {
-	now := time.Now()
-	tests := []struct {
-		name string
-		bp   client.BatchPoints
-		p    []models.Point
-		err  string
-	}{
-		{
-			name: "default",
-			bp: client.BatchPoints{
-				Points: []client.Point{
-					{Measurement: "cpu", Tags: map[string]string{"region": "useast"}, Time: now, Fields: map[string]interface{}{"value": 1.0}},
-				},
-			},
-			p: []models.Point{
-				models.MustNewPoint("cpu", map[string]string{"region": "useast"}, map[string]interface{}{"value": 1.0}, now),
-			},
-		},
-		{
-			name: "merge time",
-			bp: client.BatchPoints{
-				Time: now,
-				Points: []client.Point{
-					{Measurement: "cpu", Tags: map[string]string{"region": "useast"}, Fields: map[string]interface{}{"value": 1.0}},
-				},
-			},
-			p: []models.Point{
-				models.MustNewPoint("cpu", map[string]string{"region": "useast"}, map[string]interface{}{"value": 1.0}, now),
-			},
-		},
-		{
-			name: "merge tags",
-			bp: client.BatchPoints{
-				Tags: map[string]string{"day": "monday"},
-				Points: []client.Point{
-					{Measurement: "cpu", Tags: map[string]string{"region": "useast"}, Time: now, Fields: map[string]interface{}{"value": 1.0}},
-					{Measurement: "memory", Time: now, Fields: map[string]interface{}{"value": 2.0}},
-				},
-			},
-			p: []models.Point{
-				models.MustNewPoint("cpu", map[string]string{"day": "monday", "region": "useast"}, map[string]interface{}{"value": 1.0}, now),
-				models.MustNewPoint("memory", map[string]string{"day": "monday"}, map[string]interface{}{"value": 2.0}, now),
-			},
-		},
-	}
-
-	for _, test := range tests {
-		t.Logf("running test %q", test.name)
-		p, e := httpd.NormalizeBatchPoints(test.bp)
-		if test.err == "" && e != nil {
-			t.Errorf("unexpected error %v", e)
-		} else if test.err != "" && e == nil {
-			t.Errorf("expected error %s, got <nil>", test.err)
-		} else if e != nil && test.err != e.Error() {
-			t.Errorf("unexpected error. expected: %s, got %v", test.err, e)
-		}
-		if !reflect.DeepEqual(p, test.p) {
-			t.Logf("expected: %+v", test.p)
-			t.Logf("got:      %+v", p)
-			t.Error("failed to normalize.")
-		}
-	}
-}
-
 // NewHandler represents a test wrapper for httpd.Handler.
 type Handler struct {
 	*httpd.Handler
-	MetaStore     HandlerMetaStore
-	QueryExecutor HandlerQueryExecutor
-	TSDBStore     HandlerTSDBStore
+	MetaClient        HandlerMetaStore
+	StatementExecutor HandlerStatementExecutor
+	QueryAuthorizer   HandlerQueryAuthorizer
 }
 
 // NewHandler returns a new instance of Handler.
 func NewHandler(requireAuthentication bool) *Handler {
 	statMap := influxdb.NewStatistics("httpd", "httpd", nil)
+
+	config := httpd.NewConfig()
+	config.AuthEnabled = requireAuthentication
+	config.SharedSecret = "super secret key"
+
 	h := &Handler{
-		Handler: httpd.NewHandler(requireAuthentication, true, false, statMap),
+		Handler: httpd.NewHandler(config, statMap),
 	}
-	h.Handler.MetaStore = &h.MetaStore
-	h.Handler.QueryExecutor = &h.QueryExecutor
+	h.Handler.MetaClient = &h.MetaClient
+	h.Handler.QueryExecutor = influxql.NewQueryExecutor()
+	h.Handler.QueryExecutor.StatementExecutor = &h.StatementExecutor
+	h.Handler.QueryAuthorizer = &h.QueryAuthorizer
 	h.Handler.Version = "0.0.0"
 	return h
 }
 
-// HandlerMetaStore is a mock implementation of Handler.MetaStore.
+// HandlerMetaStore is a mock implementation of Handler.MetaClient.
 type HandlerMetaStore struct {
-	WaitForLeaderFn func(d time.Duration) error
-	DatabaseFn      func(name string) (*meta.DatabaseInfo, error)
-	AuthenticateFn  func(username, password string) (ui *meta.UserInfo, err error)
-	UsersFn         func() ([]meta.UserInfo, error)
+	PingFn         func(d time.Duration) error
+	DatabaseFn     func(name string) *meta.DatabaseInfo
+	AuthenticateFn func(username, password string) (ui *meta.UserInfo, err error)
+	UsersFn        func() []meta.UserInfo
+	UserFn         func(username string) (*meta.UserInfo, error)
 }
 
-func (s *HandlerMetaStore) WaitForLeader(d time.Duration) error {
-	if s.WaitForLeaderFn == nil {
+func (s *HandlerMetaStore) Ping(b bool) error {
+	if s.PingFn == nil {
 		// Default behaviour is to assume there is a leader.
 		return nil
 	}
-	return s.WaitForLeaderFn(d)
+	return s.Ping(b)
 }
 
-func (s *HandlerMetaStore) Database(name string) (*meta.DatabaseInfo, error) {
+func (s *HandlerMetaStore) Database(name string) *meta.DatabaseInfo {
 	return s.DatabaseFn(name)
 }
 
@@ -509,31 +469,30 @@ func (s *HandlerMetaStore) Authenticate(username, password string) (ui *meta.Use
 	return s.AuthenticateFn(username, password)
 }
 
-func (s *HandlerMetaStore) Users() ([]meta.UserInfo, error) {
+func (s *HandlerMetaStore) Users() []meta.UserInfo {
 	return s.UsersFn()
 }
 
-// HandlerQueryExecutor is a mock implementation of Handler.QueryExecutor.
-type HandlerQueryExecutor struct {
-	AuthorizeFn    func(u *meta.UserInfo, q *influxql.Query, db string) error
-	ExecuteQueryFn func(q *influxql.Query, db string, chunkSize int, closing chan struct{}) (<-chan *influxql.Result, error)
+func (s *HandlerMetaStore) User(username string) (*meta.UserInfo, error) {
+	return s.UserFn(username)
 }
 
-func (e *HandlerQueryExecutor) Authorize(u *meta.UserInfo, q *influxql.Query, db string) error {
-	return e.AuthorizeFn(u, q, db)
+// HandlerStatementExecutor is a mock implementation of Handler.StatementExecutor.
+type HandlerStatementExecutor struct {
+	ExecuteStatementFn func(stmt influxql.Statement, ctx influxql.ExecutionContext) error
 }
 
-func (e *HandlerQueryExecutor) ExecuteQuery(q *influxql.Query, db string, chunkSize int, closing chan struct{}) (<-chan *influxql.Result, error) {
-	return e.ExecuteQueryFn(q, db, chunkSize, closing)
+func (e *HandlerStatementExecutor) ExecuteStatement(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
+	return e.ExecuteStatementFn(stmt, ctx)
 }
 
-// HandlerTSDBStore is a mock implementation of Handler.TSDBStore
-type HandlerTSDBStore struct {
-	CreateMapperFn func(shardID uint64, query string, chunkSize int) (tsdb.Mapper, error)
+// HandlerQueryAuthorizer is a mock implementation of Handler.QueryAuthorizer.
+type HandlerQueryAuthorizer struct {
+	AuthorizeQueryFn func(u *meta.UserInfo, query *influxql.Query, database string) error
 }
 
-func (h *HandlerTSDBStore) CreateMapper(shardID uint64, query string, chunkSize int) (tsdb.Mapper, error) {
-	return h.CreateMapperFn(shardID, query, chunkSize)
+func (a *HandlerQueryAuthorizer) AuthorizeQuery(u *meta.UserInfo, query *influxql.Query, database string) error {
+	return a.AuthorizeQueryFn(u, query, database)
 }
 
 // MustNewRequest returns a new HTTP request. Panic on error.
@@ -565,4 +524,20 @@ func NewResultChan(results ...*influxql.Result) <-chan *influxql.Result {
 	}
 	close(ch)
 	return ch
+}
+
+// MustJWTToken returns a new JWT token and signed string or panics trying.
+func MustJWTToken(username, secret string, expired bool) (*jwt.Token, string) {
+	token := jwt.New(jwt.GetSigningMethod("HS512"))
+	token.Claims["username"] = username
+	if expired {
+		token.Claims["exp"] = time.Now().Add(-time.Second).Unix()
+	} else {
+		token.Claims["exp"] = time.Now().Add(time.Minute * 10).Unix()
+	}
+	signed, err := token.SignedString([]byte(secret))
+	if err != nil {
+		panic(err)
+	}
+	return token, signed
 }

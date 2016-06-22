@@ -1,8 +1,9 @@
-package admin
+package admin // import "github.com/influxdata/influxdb/services/admin"
 
 import (
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -10,7 +11,7 @@ import (
 	"strings"
 
 	// Register static assets via statik.
-	_ "github.com/influxdb/influxdb/statik"
+	_ "github.com/influxdata/influxdb/services/admin/statik"
 	"github.com/rakyll/statik/fs"
 )
 
@@ -21,6 +22,7 @@ type Service struct {
 	https    bool
 	cert     string
 	err      chan error
+	version  string
 
 	logger *log.Logger
 }
@@ -28,11 +30,12 @@ type Service struct {
 // NewService returns a new instance of Service.
 func NewService(c Config) *Service {
 	return &Service{
-		addr:   c.BindAddress,
-		https:  c.HTTPSEnabled,
-		cert:   c.HTTPSCertificate,
-		err:    make(chan error),
-		logger: log.New(os.Stderr, "[admin] ", log.LstdFlags),
+		addr:    c.BindAddress,
+		https:   c.HTTPSEnabled,
+		cert:    c.HTTPSCertificate,
+		err:     make(chan error),
+		version: c.Version,
+		logger:  log.New(os.Stderr, "[admin] ", log.LstdFlags),
 	}
 }
 
@@ -79,9 +82,10 @@ func (s *Service) Close() error {
 	return nil
 }
 
-// SetLogger sets the internal logger to the logger passed in.
-func (s *Service) SetLogger(l *log.Logger) {
-	s.logger = l
+// SetLogOutput sets the writer to which all logs are written. It must not be
+// called after Open is called.
+func (s *Service) SetLogOutput(w io.Writer) {
+	s.logger = log.New(w, "[admin] ", log.LstdFlags)
 }
 
 // Err returns a channel for fatal errors that occur on the listener.
@@ -97,6 +101,13 @@ func (s *Service) Addr() net.Addr {
 
 // serve serves the handler from the listener.
 func (s *Service) serve() {
+	addVersionHeaderThenServe := func(h http.Handler) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Add("X-InfluxDB-Version", s.version)
+			h.ServeHTTP(w, r)
+		}
+	}
+
 	// Instantiate file system from embedded admin.
 	statikFS, err := fs.New()
 	if err != nil {
@@ -104,7 +115,7 @@ func (s *Service) serve() {
 	}
 
 	// Run file system handler on listener.
-	err = http.Serve(s.listener, http.FileServer(statikFS))
+	err = http.Serve(s.listener, addVersionHeaderThenServe(http.FileServer(statikFS)))
 	if err != nil && !strings.Contains(err.Error(), "closed") {
 		s.err <- fmt.Errorf("listener error: addr=%s, err=%s", s.Addr(), err)
 	}

@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
-	"github.com/influxdb/influxdb/services/udp"
+	"github.com/influxdata/influxdb/services/udp"
 )
 
 func TestConfig_Parse(t *testing.T) {
@@ -19,6 +19,7 @@ retention-policy = "awesomerp"
 batch-size = 100
 batch-pending = 9
 batch-timeout = "10ms"
+udp-payload-size = 1500
 `, &c); err != nil {
 		t.Fatal(err)
 	}

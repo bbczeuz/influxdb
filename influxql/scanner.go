@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 )
 
 // Scanner represents a lexical scanner for InfluxQL.
@@ -54,6 +53,12 @@ func (s *Scanner) Scan() (tok Token, pos Pos, lit string) {
 			return s.scanNumber()
 		}
 		return DOT, pos, ""
+	case '$':
+		tok, _, lit := s.scanIdent()
+		if tok == IDENT {
+			tok = BOUNDPARAM
+		}
+		return tok, pos, lit
 	case '+', '-':
 		return s.scanNumber()
 	case '*':
@@ -96,6 +101,10 @@ func (s *Scanner) Scan() (tok Token, pos Pos, lit string) {
 	case ';':
 		return SEMICOLON, pos, ""
 	case ':':
+		if ch1, _ := s.r.read(); ch1 == ':' {
+			return DOUBLECOLON, pos, ""
+		}
+		s.r.unread()
 		return COLON, pos, ""
 	}
 
@@ -176,6 +185,7 @@ func (s *Scanner) scanString() (tok Token, pos Pos, lit string) {
 	return STRING, pos, lit
 }
 
+// ScanRegex consumes a token to find escapes
 func (s *Scanner) ScanRegex() (tok Token, pos Pos, lit string) {
 	_, pos = s.r.curr()
 
@@ -237,25 +247,26 @@ func (s *Scanner) scanNumber() (tok Token, pos Pos, lit string) {
 	_, _ = buf.WriteString(s.scanDigits())
 
 	// If next code points are a full stop and digit then consume them.
+	isDecimal := false
 	if ch0, _ := s.r.read(); ch0 == '.' {
+		isDecimal = true
 		if ch1, _ := s.r.read(); isDigit(ch1) {
 			_, _ = buf.WriteRune(ch0)
 			_, _ = buf.WriteRune(ch1)
 			_, _ = buf.WriteString(s.scanDigits())
 		} else {
 			s.r.unread()
-			s.r.unread()
 		}
 	} else {
 		s.r.unread()
 	}
 
-	// Attempt to read as a duration if it doesn't have a fractional part.
-	if !strings.Contains(buf.String(), ".") {
+	// Read as a duration or integer if it doesn't have a fractional part.
+	if !isDecimal {
 		// If the next rune is a duration unit (u,µ,ms,s) then return a duration token
 		if ch0, _ := s.r.read(); ch0 == 'u' || ch0 == 'µ' || ch0 == 's' || ch0 == 'h' || ch0 == 'd' || ch0 == 'w' {
 			_, _ = buf.WriteRune(ch0)
-			return DURATION_VAL, pos, buf.String()
+			return DURATIONVAL, pos, buf.String()
 		} else if ch0 == 'm' {
 			_, _ = buf.WriteRune(ch0)
 			if ch1, _ := s.r.read(); ch1 == 's' {
@@ -263,9 +274,10 @@ func (s *Scanner) scanNumber() (tok Token, pos Pos, lit string) {
 			} else {
 				s.r.unread()
 			}
-			return DURATION_VAL, pos, buf.String()
+			return DURATIONVAL, pos, buf.String()
 		}
 		s.r.unread()
+		return INTEGER, pos, buf.String()
 	}
 	return NUMBER, pos, buf.String()
 }
@@ -444,6 +456,7 @@ func (r *reader) curr() (ch rune, pos Pos) {
 // eof is a marker code point to signify that the reader can't read any more.
 const eof = rune(0)
 
+// ScanDelimited reads a delimited set of runes
 func ScanDelimited(r io.RuneScanner, start, end rune, escapes map[rune]rune, escapesPassThru bool) ([]byte, error) {
 	// Scan start delimiter.
 	if ch, _, err := r.ReadRune(); err != nil {

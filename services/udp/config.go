@@ -3,12 +3,18 @@ package udp
 import (
 	"time"
 
-	"github.com/influxdb/influxdb/toml"
+	"github.com/influxdata/influxdb/toml"
 )
 
 const (
+	// DefaultBindAddress is the default binding interface if none is specified.
+	DefaultBindAddress = ":8089"
+
 	// DefaultDatabase is the default database for UDP traffic.
 	DefaultDatabase = "udp"
+
+	// DefaultRetentionPolicy is the default retention policy used for writes.
+	DefaultRetentionPolicy = ""
 
 	// DefaultBatchSize is the default UDP batch size.
 	DefaultBatchSize = 5000
@@ -18,6 +24,9 @@ const (
 
 	// DefaultBatchTimeout is the default UDP batch timeout.
 	DefaultBatchTimeout = time.Second
+
+	// DefaultPrecision is the default time precision used for UDP services.
+	DefaultPrecision = "n"
 
 	// DefaultReadBuffer is the default buffer size for the UDP listener.
 	// Sets the size of the operating system's receive buffer associated with
@@ -44,6 +53,22 @@ type Config struct {
 	BatchPending    int           `toml:"batch-pending"`
 	ReadBuffer      int           `toml:"read-buffer"`
 	BatchTimeout    toml.Duration `toml:"batch-timeout"`
+	Precision       string        `toml:"precision"`
+
+	// Deprecated config option
+	udpPayloadSize int `toml:"udp-payload-size"`
+}
+
+// NewConfig returns a new instance of Config with defaults.
+func NewConfig() Config {
+	return Config{
+		BindAddress:     DefaultBindAddress,
+		Database:        DefaultDatabase,
+		RetentionPolicy: DefaultRetentionPolicy,
+		BatchSize:       DefaultBatchSize,
+		BatchPending:    DefaultBatchPending,
+		BatchTimeout:    toml.Duration(DefaultBatchTimeout),
+	}
 }
 
 // WithDefaults takes the given config and returns a new config with any required
@@ -61,6 +86,9 @@ func (c *Config) WithDefaults() *Config {
 	}
 	if d.BatchTimeout == 0 {
 		d.BatchTimeout = toml.Duration(DefaultBatchTimeout)
+	}
+	if d.Precision == "" {
+		d.Precision = DefaultPrecision
 	}
 	if d.ReadBuffer == 0 {
 		d.ReadBuffer = DefaultReadBuffer

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/influxdb/influxdb/influxql"
+	"github.com/influxdata/influxdb/influxql"
 )
 
 // Ensure the scanner can scan tokens correctly.
@@ -57,6 +57,8 @@ func TestScanner_Scan(t *testing.T) {
 		{s: `.`, tok: influxql.DOT},
 		{s: `=~`, tok: influxql.EQREGEX},
 		{s: `!~`, tok: influxql.NEQREGEX},
+		{s: `:`, tok: influxql.COLON},
+		{s: `::`, tok: influxql.DOUBLECOLON},
 
 		// Identifiers
 		{s: `foo`, tok: influxql.IDENT, lit: `foo`},
@@ -68,6 +70,8 @@ func TestScanner_Scan(t *testing.T) {
 		{s: `"foo\"bar\""`, tok: influxql.IDENT, lit: `foo"bar"`},
 		{s: `test"`, tok: influxql.BADSTRING, lit: "", pos: influxql.Pos{Line: 0, Char: 3}},
 		{s: `"test`, tok: influxql.BADSTRING, lit: `test`},
+		{s: `$host`, tok: influxql.BOUNDPARAM, lit: `host`},
+		{s: `$"host param"`, tok: influxql.BOUNDPARAM, lit: `host param`},
 
 		{s: `true`, tok: influxql.TRUE},
 		{s: `false`, tok: influxql.FALSE},
@@ -81,7 +85,8 @@ func TestScanner_Scan(t *testing.T) {
 		{s: `'test\g'`, tok: influxql.BADESCAPE, lit: `\g`, pos: influxql.Pos{Line: 0, Char: 6}},
 
 		// Numbers
-		{s: `100`, tok: influxql.NUMBER, lit: `100`},
+		{s: `100`, tok: influxql.INTEGER, lit: `100`},
+		{s: `-100`, tok: influxql.INTEGER, lit: `-100`},
 		{s: `100.23`, tok: influxql.NUMBER, lit: `100.23`},
 		{s: `+100.23`, tok: influxql.NUMBER, lit: `+100.23`},
 		{s: `-100.23`, tok: influxql.NUMBER, lit: `-100.23`},
@@ -95,15 +100,15 @@ func TestScanner_Scan(t *testing.T) {
 		{s: `10.3s`, tok: influxql.NUMBER, lit: `10.3`},
 
 		// Durations
-		{s: `10u`, tok: influxql.DURATION_VAL, lit: `10u`},
-		{s: `10µ`, tok: influxql.DURATION_VAL, lit: `10µ`},
-		{s: `10ms`, tok: influxql.DURATION_VAL, lit: `10ms`},
-		{s: `-1s`, tok: influxql.DURATION_VAL, lit: `-1s`},
-		{s: `10m`, tok: influxql.DURATION_VAL, lit: `10m`},
-		{s: `10h`, tok: influxql.DURATION_VAL, lit: `10h`},
-		{s: `10d`, tok: influxql.DURATION_VAL, lit: `10d`},
-		{s: `10w`, tok: influxql.DURATION_VAL, lit: `10w`},
-		{s: `10x`, tok: influxql.NUMBER, lit: `10`}, // non-duration unit
+		{s: `10u`, tok: influxql.DURATIONVAL, lit: `10u`},
+		{s: `10µ`, tok: influxql.DURATIONVAL, lit: `10µ`},
+		{s: `10ms`, tok: influxql.DURATIONVAL, lit: `10ms`},
+		{s: `-1s`, tok: influxql.DURATIONVAL, lit: `-1s`},
+		{s: `10m`, tok: influxql.DURATIONVAL, lit: `10m`},
+		{s: `10h`, tok: influxql.DURATIONVAL, lit: `10h`},
+		{s: `10d`, tok: influxql.DURATIONVAL, lit: `10d`},
+		{s: `10w`, tok: influxql.DURATIONVAL, lit: `10w`},
+		{s: `10x`, tok: influxql.INTEGER, lit: `10`}, // non-duration unit
 
 		// Keywords
 		{s: `ALL`, tok: influxql.ALL},
@@ -122,6 +127,7 @@ func TestScanner_Scan(t *testing.T) {
 		{s: `DROP`, tok: influxql.DROP},
 		{s: `DURATION`, tok: influxql.DURATION},
 		{s: `END`, tok: influxql.END},
+		{s: `EVERY`, tok: influxql.EVERY},
 		{s: `EXISTS`, tok: influxql.EXISTS},
 		{s: `EXPLAIN`, tok: influxql.EXPLAIN},
 		{s: `FIELD`, tok: influxql.FIELD},
@@ -130,11 +136,11 @@ func TestScanner_Scan(t *testing.T) {
 		{s: `GROUP`, tok: influxql.GROUP},
 		{s: `GROUPS`, tok: influxql.GROUPS},
 		{s: `IF`, tok: influxql.IF},
-		{s: `INNER`, tok: influxql.INNER},
 		{s: `INSERT`, tok: influxql.INSERT},
 		{s: `INTO`, tok: influxql.INTO},
 		{s: `KEY`, tok: influxql.KEY},
 		{s: `KEYS`, tok: influxql.KEYS},
+		{s: `KILL`, tok: influxql.KILL},
 		{s: `LIMIT`, tok: influxql.LIMIT},
 		{s: `SHOW`, tok: influxql.SHOW},
 		{s: `SHARD`, tok: influxql.SHARD},
@@ -152,12 +158,12 @@ func TestScanner_Scan(t *testing.T) {
 		{s: `QUERIES`, tok: influxql.QUERIES},
 		{s: `QUERY`, tok: influxql.QUERY},
 		{s: `READ`, tok: influxql.READ},
+		{s: `REPLICATION`, tok: influxql.REPLICATION},
+		{s: `RESAMPLE`, tok: influxql.RESAMPLE},
 		{s: `RETENTION`, tok: influxql.RETENTION},
 		{s: `REVOKE`, tok: influxql.REVOKE},
 		{s: `SELECT`, tok: influxql.SELECT},
 		{s: `SERIES`, tok: influxql.SERIES},
-		{s: `SERVER`, tok: influxql.SERVER},
-		{s: `SERVERS`, tok: influxql.SERVERS},
 		{s: `TAG`, tok: influxql.TAG},
 		{s: `TO`, tok: influxql.TO},
 		{s: `USER`, tok: influxql.USER},

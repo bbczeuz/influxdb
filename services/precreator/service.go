@@ -1,6 +1,7 @@
-package precreator
+package precreator // import "github.com/influxdata/influxdb/services/precreator"
 
 import (
+	"io"
 	"log"
 	"os"
 	"sync"
@@ -17,8 +18,7 @@ type Service struct {
 	done chan struct{}
 	wg   sync.WaitGroup
 
-	MetaStore interface {
-		IsLeader() bool
+	MetaClient interface {
 		PrecreateShardGroups(now, cutoff time.Time) error
 	}
 }
@@ -34,9 +34,10 @@ func NewService(c Config) (*Service, error) {
 	return &s, nil
 }
 
-// SetLogger sets the internal logger to the logger passed in.
-func (s *Service) SetLogger(l *log.Logger) {
-	s.Logger = l
+// SetLogOutput sets the writer to which all logs are written. It must not be
+// called after Open is called.
+func (s *Service) SetLogOutput(w io.Writer) {
+	s.Logger = log.New(w, "[shard-precreation] ", log.LstdFlags)
 }
 
 // Open starts the precreation service.
@@ -75,12 +76,6 @@ func (s *Service) runPrecreation() {
 	for {
 		select {
 		case <-time.After(s.checkInterval):
-			// Only run this on the leader, but always allow the loop to check
-			// as the leader can change.
-			if !s.MetaStore.IsLeader() {
-				continue
-			}
-
 			if err := s.precreate(time.Now().UTC()); err != nil {
 				s.Logger.Printf("failed to precreate shards: %s", err.Error())
 			}
@@ -94,7 +89,7 @@ func (s *Service) runPrecreation() {
 // precreate performs actual resource precreation.
 func (s *Service) precreate(now time.Time) error {
 	cutoff := now.Add(s.advancePeriod).UTC()
-	if err := s.MetaStore.PrecreateShardGroups(now, cutoff); err != nil {
+	if err := s.MetaClient.PrecreateShardGroups(now, cutoff); err != nil {
 		return err
 	}
 	return nil

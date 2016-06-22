@@ -3,7 +3,7 @@ package collectd
 import (
 	"time"
 
-	"github.com/influxdb/influxdb/toml"
+	"github.com/influxdata/influxdb/toml"
 )
 
 const (
@@ -67,4 +67,36 @@ func NewConfig() Config {
 		BatchDuration:   DefaultBatchDuration,
 		TypesDB:         DefaultTypesDB,
 	}
+}
+
+// WithDefaults takes the given config and returns a new config with any required
+// default values set.
+func (c *Config) WithDefaults() *Config {
+	d := *c
+	if d.BindAddress == "" {
+		d.BindAddress = DefaultBindAddress
+	}
+	if d.Database == "" {
+		d.Database = DefaultDatabase
+	}
+	if d.RetentionPolicy == "" {
+		d.RetentionPolicy = DefaultRetentionPolicy
+	}
+	if d.BatchSize == 0 {
+		d.BatchSize = DefaultBatchSize
+	}
+	if d.BatchPending == 0 {
+		d.BatchPending = DefaultBatchPending
+	}
+	if d.BatchDuration == 0 {
+		d.BatchDuration = DefaultBatchDuration
+	}
+	if d.ReadBuffer == 0 {
+		d.ReadBuffer = DefaultReadBuffer
+	}
+	if d.TypesDB == "" {
+		d.TypesDB = DefaultTypesDB
+	}
+
+	return &d
 }

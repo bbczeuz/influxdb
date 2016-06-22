@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/BurntSushi/toml"
-	"github.com/influxdb/influxdb/services/httpd"
+	"github.com/influxdata/influxdb/services/httpd"
 )
 
 func TestConfig_Parse(t *testing.T) {
@@ -46,7 +46,7 @@ https-certificate = "/dev/null"
 func TestConfig_WriteTracing(t *testing.T) {
 	c := httpd.Config{WriteTracing: true}
 	s := httpd.NewService(c)
-	if !s.Handler.WriteTrace {
+	if !s.Handler.Config.WriteTracing {
 		t.Fatalf("write tracing was not set")
 	}
 }

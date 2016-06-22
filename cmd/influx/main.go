@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/influxdb/influxdb/client"
-	"github.com/influxdb/influxdb/cmd/influx/cli"
+	"github.com/influxdata/influxdb/client"
+	"github.com/influxdata/influxdb/cmd/influx/cli"
 )
 
 // These variables are populated via the Go linker.
 var (
-	version = "0.9"
+	version string
 )
 
 const (
@@ -26,6 +26,13 @@ const (
 	defaultPPS = 0
 )
 
+func init() {
+	// If version is not set, make that clear.
+	if version == "" {
+		version = "unknown"
+	}
+}
+
 func main() {
 	c := cli.New(version)
 
@@ -36,9 +43,10 @@ func main() {
 	fs.StringVar(&c.Password, "password", c.Password, `Password to connect to the server.  Leaving blank will prompt for password (--password="").`)
 	fs.StringVar(&c.Database, "database", c.Database, "Database to connect to the server.")
 	fs.BoolVar(&c.Ssl, "ssl", false, "Use https for connecting to cluster.")
+	fs.BoolVar(&c.UnsafeSsl, "unsafeSsl", false, "Set this when connecting to the cluster using https and not use SSL verification.")
 	fs.StringVar(&c.Format, "format", defaultFormat, "Format specifies the format of the server responses:  json, csv, or column.")
 	fs.StringVar(&c.Precision, "precision", defaultPrecision, "Precision specifies the format of the timestamp:  rfc3339,h,m,s,ms,u or ns.")
-	fs.StringVar(&c.WriteConsistency, "consistency", "any", "Set write consistency level: any, one, quorum, or all.")
+	fs.StringVar(&c.WriteConsistency, "consistency", "all", "Set write consistency level: any, one, quorum, or all.")
 	fs.BoolVar(&c.Pretty, "pretty", false, "Turns on pretty print for the json format.")
 	fs.StringVar(&c.Execute, "execute", c.Execute, "Execute command and quit.")
 	fs.BoolVar(&c.ShowVersion, "version", false, "Displays the InfluxDB version.")
@@ -64,6 +72,8 @@ func main() {
        Username to connect to the server.
   -ssl
         Use https for requests.
+  -unsafeSsl
+        Set this when connecting to the cluster using https and not use SSL verification.
   -execute 'command'
        Execute command and quit.
   -format 'json|csv|column'
@@ -99,5 +109,8 @@ Examples:
 		os.Exit(0)
 	}
 
-	c.Run()
+	if err := c.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "%s\n", err)
+		os.Exit(1)
+	}
 }

@@ -1,9 +1,10 @@
-package graphite
+package graphite // import "github.com/influxdata/influxdb/services/graphite"
 
 import (
 	"bufio"
 	"expvar"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net"
@@ -12,17 +13,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/influxdb/influxdb"
-	"github.com/influxdb/influxdb/cluster"
-	"github.com/influxdb/influxdb/meta"
-	"github.com/influxdb/influxdb/monitor"
-	"github.com/influxdb/influxdb/tsdb"
+	"github.com/influxdata/influxdb"
+	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/monitor/diagnostics"
+	"github.com/influxdata/influxdb/services/meta"
+	"github.com/influxdata/influxdb/tsdb"
 )
 
-const (
-	udpBufferSize     = 65536
-	leaderWaitTimeout = 30 * time.Second
-)
+const udpBufferSize = 65536
 
 // statistics gathered by the graphite package.
 const (
@@ -30,7 +28,6 @@ const (
 	statBytesReceived       = "bytesRx"
 	statPointsParseFail     = "pointsParseFail"
 	statPointsNaNFail       = "pointsNaNFail"
-	statPointsUnsupported   = "pointsUnsupportedFail"
 	statBatchesTransmitted  = "batchesTx"
 	statPointsTransmitted   = "pointsTx"
 	statBatchesTransmitFail = "batchesTxFail"
@@ -51,14 +48,14 @@ func (c *tcpConnection) Close() {
 type Service struct {
 	mu sync.Mutex
 
-	bindAddress      string
-	database         string
-	protocol         string
-	batchSize        int
-	batchPending     int
-	batchTimeout     time.Duration
-	consistencyLevel cluster.ConsistencyLevel
-	udpReadBuffer    int
+	bindAddress     string
+	database        string
+	retentionPolicy string
+	protocol        string
+	batchSize       int
+	batchPending    int
+	batchTimeout    time.Duration
+	udpReadBuffer   int
 
 	batcher *tsdb.PointBatcher
 	parser  *Parser
@@ -67,6 +64,7 @@ type Service struct {
 	statMap          *expvar.Map
 	tcpConnectionsMu sync.Mutex
 	tcpConnections   map[string]*tcpConnection
+	diagsKey         string
 
 	ln      net.Listener
 	addr    net.Addr
@@ -76,15 +74,18 @@ type Service struct {
 	done chan struct{}
 
 	Monitor interface {
-		RegisterDiagnosticsClient(name string, client monitor.DiagsClient)
+		RegisterDiagnosticsClient(name string, client diagnostics.Client)
 		DeregisterDiagnosticsClient(name string)
 	}
 	PointsWriter interface {
-		WritePoints(p *cluster.WritePointsRequest) error
+		WritePoints(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, points []models.Point) error
 	}
-	MetaStore interface {
-		WaitForLeader(d time.Duration) error
-		CreateDatabaseIfNotExists(name string) (*meta.DatabaseInfo, error)
+	MetaClient interface {
+		CreateDatabase(name string) (*meta.DatabaseInfo, error)
+		CreateDatabaseWithRetentionPolicy(name string, rpi *meta.RetentionPolicyInfo) (*meta.DatabaseInfo, error)
+		CreateRetentionPolicy(database string, rpi *meta.RetentionPolicyInfo) (*meta.RetentionPolicyInfo, error)
+		Database(name string) *meta.DatabaseInfo
+		RetentionPolicy(database, name string) (*meta.RetentionPolicyInfo, error)
 	}
 }
 
@@ -94,23 +95,19 @@ func NewService(c Config) (*Service, error) {
 	d := c.WithDefaults()
 
 	s := Service{
-		bindAddress:    d.BindAddress,
-		database:       d.Database,
-		protocol:       d.Protocol,
-		batchSize:      d.BatchSize,
-		batchPending:   d.BatchPending,
-		udpReadBuffer:  d.UDPReadBuffer,
-		batchTimeout:   time.Duration(d.BatchTimeout),
-		logger:         log.New(os.Stderr, "[graphite] ", log.LstdFlags),
-		tcpConnections: make(map[string]*tcpConnection),
-		done:           make(chan struct{}),
+		bindAddress:     d.BindAddress,
+		database:        d.Database,
+		retentionPolicy: d.RetentionPolicy,
+		protocol:        d.Protocol,
+		batchSize:       d.BatchSize,
+		batchPending:    d.BatchPending,
+		udpReadBuffer:   d.UDPReadBuffer,
+		batchTimeout:    time.Duration(d.BatchTimeout),
+		logger:          log.New(os.Stderr, fmt.Sprintf("[graphite] %s ", d.BindAddress), log.LstdFlags),
+		tcpConnections:  make(map[string]*tcpConnection),
+		done:            make(chan struct{}),
+		diagsKey:        strings.Join([]string{"graphite", d.Protocol, d.BindAddress}, ":"),
 	}
-
-	consistencyLevel, err := cluster.ParseConsistencyLevel(d.ConsistencyLevel)
-	if err != nil {
-		return nil, err
-	}
-	s.consistencyLevel = consistencyLevel
 
 	parser, err := NewParserWithOptions(Options{
 		Templates:   d.Templates,
@@ -134,23 +131,27 @@ func (s *Service) Open() error {
 
 	// Configure expvar monitoring. It's OK to do this even if the service fails to open and
 	// should be done before any data could arrive for the service.
-	key := strings.Join([]string{"graphite", s.protocol, s.bindAddress}, ":")
 	tags := map[string]string{"proto": s.protocol, "bind": s.bindAddress}
-	s.statMap = influxdb.NewStatistics(key, "graphite", tags)
+	s.statMap = influxdb.NewStatistics(s.diagsKey, "graphite", tags)
 
 	// Register diagnostics if a Monitor service is available.
 	if s.Monitor != nil {
-		s.Monitor.RegisterDiagnosticsClient(key, s)
+		s.Monitor.RegisterDiagnosticsClient(s.diagsKey, s)
 	}
 
-	if err := s.MetaStore.WaitForLeader(leaderWaitTimeout); err != nil {
-		s.logger.Printf("Failed to detect a cluster leader: %s", err.Error())
-		return err
-	}
-
-	if _, err := s.MetaStore.CreateDatabaseIfNotExists(s.database); err != nil {
-		s.logger.Printf("Failed to ensure target database %s exists: %s", s.database, err.Error())
-		return err
+	if db := s.MetaClient.Database(s.database); db != nil {
+		if rp, _ := s.MetaClient.RetentionPolicy(s.database, s.retentionPolicy); rp == nil {
+			rpi := meta.NewRetentionPolicyInfo(s.retentionPolicy)
+			if _, err := s.MetaClient.CreateRetentionPolicy(s.database, rpi); err != nil {
+				s.logger.Printf("Failed to ensure target retention policy %s exists: %s", s.database, err.Error())
+			}
+		}
+	} else {
+		rpi := meta.NewRetentionPolicyInfo(s.retentionPolicy)
+		if _, err := s.MetaClient.CreateDatabaseWithRetentionPolicy(s.database, rpi); err != nil {
+			s.logger.Printf("Failed to ensure target database %s exists: %s", s.database, err.Error())
+			return err
+		}
 	}
 
 	s.batcher = tsdb.NewPointBatcher(s.batchSize, s.batchPending, s.batchTimeout)
@@ -200,6 +201,11 @@ func (s *Service) Close() error {
 	if s.batcher != nil {
 		s.batcher.Stop()
 	}
+
+	if s.Monitor != nil {
+		s.Monitor.DeregisterDiagnosticsClient(s.diagsKey)
+	}
+
 	close(s.done)
 	s.wg.Wait()
 	s.done = nil
@@ -207,9 +213,10 @@ func (s *Service) Close() error {
 	return nil
 }
 
-// SetLogger sets the internal logger to the logger passed in.
-func (s *Service) SetLogger(l *log.Logger) {
-	s.logger = l
+// SetLogOutput sets the writer to which all logs are written. It must not be
+// called after Open is called.
+func (s *Service) SetLogOutput(w io.Writer) {
+	s.logger = log.New(w, "[graphite] ", log.LstdFlags)
 }
 
 // Addr returns the address the Service binds to.
@@ -339,7 +346,7 @@ func (s *Service) handleLine(line string) {
 	point, err := s.parser.Parse(line)
 	if err != nil {
 		switch err := err.(type) {
-		case *UnsupposedValueError:
+		case *UnsupportedValueError:
 			// Graphite ignores NaN values with no error.
 			if math.IsNaN(err.Value) {
 				s.statMap.Add(statPointsNaNFail, 1)
@@ -360,12 +367,7 @@ func (s *Service) processBatches(batcher *tsdb.PointBatcher) {
 	for {
 		select {
 		case batch := <-batcher.Out():
-			if err := s.PointsWriter.WritePoints(&cluster.WritePointsRequest{
-				Database:         s.database,
-				RetentionPolicy:  "",
-				ConsistencyLevel: s.consistencyLevel,
-				Points:           batch,
-			}); err == nil {
+			if err := s.PointsWriter.WritePoints(s.database, s.retentionPolicy, models.ConsistencyLevelAny, batch); err == nil {
 				s.statMap.Add(statBatchesTransmitted, 1)
 				s.statMap.Add(statPointsTransmitted, int64(len(batch)))
 			} else {
@@ -380,16 +382,15 @@ func (s *Service) processBatches(batcher *tsdb.PointBatcher) {
 }
 
 // Diagnostics returns diagnostics of the graphite service.
-func (s *Service) Diagnostics() (*monitor.Diagnostic, error) {
+func (s *Service) Diagnostics() (*diagnostics.Diagnostics, error) {
 	s.tcpConnectionsMu.Lock()
 	defer s.tcpConnectionsMu.Unlock()
 
-	d := &monitor.Diagnostic{
+	d := &diagnostics.Diagnostics{
 		Columns: []string{"local", "remote", "connect time"},
 		Rows:    make([][]interface{}, 0, len(s.tcpConnections)),
 	}
 	for _, v := range s.tcpConnections {
-		_ = v
 		d.Rows = append(d.Rows, []interface{}{v.conn.LocalAddr().String(), v.conn.RemoteAddr().String(), v.connectTime})
 	}
 	return d, nil

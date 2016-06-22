@@ -5,40 +5,39 @@ import (
 	"testing"
 	"time"
 
-	"github.com/influxdb/influxdb/cluster"
-	"github.com/influxdb/influxdb/meta"
-	"github.com/influxdb/influxdb/services/subscriber"
+	"github.com/influxdata/influxdb/coordinator"
+	"github.com/influxdata/influxdb/services/meta"
+	"github.com/influxdata/influxdb/services/subscriber"
 )
 
-type MetaStore struct {
-	DatabasesFn          func() ([]meta.DatabaseInfo, error)
-	WaitForDataChangedFn func() error
+type MetaClient struct {
+	DatabasesFn          func() []meta.DatabaseInfo
+	WaitForDataChangedFn func() chan struct{}
 }
 
-func (m MetaStore) Databases() ([]meta.DatabaseInfo, error) {
+func (m MetaClient) Databases() []meta.DatabaseInfo {
 	return m.DatabasesFn()
 }
 
-func (m MetaStore) WaitForDataChanged() error {
+func (m MetaClient) WaitForDataChanged() chan struct{} {
 	return m.WaitForDataChangedFn()
 }
 
 type Subscription struct {
-	WritePointsFn func(*cluster.WritePointsRequest) error
+	WritePointsFn func(*coordinator.WritePointsRequest) error
 }
 
-func (s Subscription) WritePoints(p *cluster.WritePointsRequest) error {
+func (s Subscription) WritePoints(p *coordinator.WritePointsRequest) error {
 	return s.WritePointsFn(p)
 }
 
 func TestService_IgnoreNonMatch(t *testing.T) {
-	dataChanged := make(chan bool)
-	ms := MetaStore{}
-	ms.WaitForDataChangedFn = func() error {
-		<-dataChanged
-		return nil
+	dataChanged := make(chan struct{})
+	ms := MetaClient{}
+	ms.WaitForDataChangedFn = func() chan struct{} {
+		return dataChanged
 	}
-	ms.DatabasesFn = func() ([]meta.DatabaseInfo, error) {
+	ms.DatabasesFn = func() []meta.DatabaseInfo {
 		return []meta.DatabaseInfo{
 			{
 				Name: "db0",
@@ -51,14 +50,14 @@ func TestService_IgnoreNonMatch(t *testing.T) {
 					},
 				},
 			},
-		}, nil
+		}
 	}
 
-	prs := make(chan *cluster.WritePointsRequest, 2)
+	prs := make(chan *coordinator.WritePointsRequest, 2)
 	urls := make(chan url.URL, 2)
 	newPointsWriter := func(u url.URL) (subscriber.PointsWriter, error) {
 		sub := Subscription{}
-		sub.WritePointsFn = func(p *cluster.WritePointsRequest) error {
+		sub.WritePointsFn = func(p *coordinator.WritePointsRequest) error {
 			prs <- p
 			return nil
 		}
@@ -67,13 +66,13 @@ func TestService_IgnoreNonMatch(t *testing.T) {
 	}
 
 	s := subscriber.NewService(subscriber.NewConfig())
-	s.MetaStore = ms
+	s.MetaClient = ms
 	s.NewPointsWriter = newPointsWriter
 	s.Open()
 	defer s.Close()
 
 	// Signal that data has changed
-	dataChanged <- true
+	dataChanged <- struct{}{}
 
 	for _, expURLStr := range []string{"udp://h0:9093", "udp://h1:9093"} {
 		var u url.URL
@@ -89,11 +88,11 @@ func TestService_IgnoreNonMatch(t *testing.T) {
 	}
 
 	// Write points that don't match any subscription.
-	s.Points() <- &cluster.WritePointsRequest{
+	s.Points() <- &coordinator.WritePointsRequest{
 		Database:        "db1",
 		RetentionPolicy: "rp0",
 	}
-	s.Points() <- &cluster.WritePointsRequest{
+	s.Points() <- &coordinator.WritePointsRequest{
 		Database:        "db0",
 		RetentionPolicy: "rp2",
 	}
@@ -108,13 +107,12 @@ func TestService_IgnoreNonMatch(t *testing.T) {
 }
 
 func TestService_ModeALL(t *testing.T) {
-	dataChanged := make(chan bool)
-	ms := MetaStore{}
-	ms.WaitForDataChangedFn = func() error {
-		<-dataChanged
-		return nil
+	dataChanged := make(chan struct{})
+	ms := MetaClient{}
+	ms.WaitForDataChangedFn = func() chan struct{} {
+		return dataChanged
 	}
-	ms.DatabasesFn = func() ([]meta.DatabaseInfo, error) {
+	ms.DatabasesFn = func() []meta.DatabaseInfo {
 		return []meta.DatabaseInfo{
 			{
 				Name: "db0",
@@ -127,14 +125,14 @@ func TestService_ModeALL(t *testing.T) {
 					},
 				},
 			},
-		}, nil
+		}
 	}
 
-	prs := make(chan *cluster.WritePointsRequest, 2)
+	prs := make(chan *coordinator.WritePointsRequest, 2)
 	urls := make(chan url.URL, 2)
 	newPointsWriter := func(u url.URL) (subscriber.PointsWriter, error) {
 		sub := Subscription{}
-		sub.WritePointsFn = func(p *cluster.WritePointsRequest) error {
+		sub.WritePointsFn = func(p *coordinator.WritePointsRequest) error {
 			prs <- p
 			return nil
 		}
@@ -143,13 +141,13 @@ func TestService_ModeALL(t *testing.T) {
 	}
 
 	s := subscriber.NewService(subscriber.NewConfig())
-	s.MetaStore = ms
+	s.MetaClient = ms
 	s.NewPointsWriter = newPointsWriter
 	s.Open()
 	defer s.Close()
 
 	// Signal that data has changed
-	dataChanged <- true
+	dataChanged <- struct{}{}
 
 	for _, expURLStr := range []string{"udp://h0:9093", "udp://h1:9093"} {
 		var u url.URL
@@ -165,7 +163,7 @@ func TestService_ModeALL(t *testing.T) {
 	}
 
 	// Write points that match subscription with mode ALL
-	expPR := &cluster.WritePointsRequest{
+	expPR := &coordinator.WritePointsRequest{
 		Database:        "db0",
 		RetentionPolicy: "rp0",
 	}
@@ -173,7 +171,7 @@ func TestService_ModeALL(t *testing.T) {
 
 	// Should get pr back twice
 	for i := 0; i < 2; i++ {
-		var pr *cluster.WritePointsRequest
+		var pr *coordinator.WritePointsRequest
 		select {
 		case pr = <-prs:
 		case <-time.After(10 * time.Millisecond):
@@ -187,13 +185,12 @@ func TestService_ModeALL(t *testing.T) {
 }
 
 func TestService_ModeANY(t *testing.T) {
-	dataChanged := make(chan bool)
-	ms := MetaStore{}
-	ms.WaitForDataChangedFn = func() error {
-		<-dataChanged
-		return nil
+	dataChanged := make(chan struct{})
+	ms := MetaClient{}
+	ms.WaitForDataChangedFn = func() chan struct{} {
+		return dataChanged
 	}
-	ms.DatabasesFn = func() ([]meta.DatabaseInfo, error) {
+	ms.DatabasesFn = func() []meta.DatabaseInfo {
 		return []meta.DatabaseInfo{
 			{
 				Name: "db0",
@@ -206,14 +203,14 @@ func TestService_ModeANY(t *testing.T) {
 					},
 				},
 			},
-		}, nil
+		}
 	}
 
-	prs := make(chan *cluster.WritePointsRequest, 2)
+	prs := make(chan *coordinator.WritePointsRequest, 2)
 	urls := make(chan url.URL, 2)
 	newPointsWriter := func(u url.URL) (subscriber.PointsWriter, error) {
 		sub := Subscription{}
-		sub.WritePointsFn = func(p *cluster.WritePointsRequest) error {
+		sub.WritePointsFn = func(p *coordinator.WritePointsRequest) error {
 			prs <- p
 			return nil
 		}
@@ -222,13 +219,13 @@ func TestService_ModeANY(t *testing.T) {
 	}
 
 	s := subscriber.NewService(subscriber.NewConfig())
-	s.MetaStore = ms
+	s.MetaClient = ms
 	s.NewPointsWriter = newPointsWriter
 	s.Open()
 	defer s.Close()
 
 	// Signal that data has changed
-	dataChanged <- true
+	dataChanged <- struct{}{}
 
 	for _, expURLStr := range []string{"udp://h0:9093", "udp://h1:9093"} {
 		var u url.URL
@@ -243,14 +240,14 @@ func TestService_ModeANY(t *testing.T) {
 		}
 	}
 	// Write points that match subscription with mode ANY
-	expPR := &cluster.WritePointsRequest{
+	expPR := &coordinator.WritePointsRequest{
 		Database:        "db0",
 		RetentionPolicy: "rp0",
 	}
 	s.Points() <- expPR
 
 	// Validate we get the pr back just once
-	var pr *cluster.WritePointsRequest
+	var pr *coordinator.WritePointsRequest
 	select {
 	case pr = <-prs:
 	case <-time.After(10 * time.Millisecond):
@@ -270,13 +267,12 @@ func TestService_ModeANY(t *testing.T) {
 }
 
 func TestService_Multiple(t *testing.T) {
-	dataChanged := make(chan bool)
-	ms := MetaStore{}
-	ms.WaitForDataChangedFn = func() error {
-		<-dataChanged
-		return nil
+	dataChanged := make(chan struct{})
+	ms := MetaClient{}
+	ms.WaitForDataChangedFn = func() chan struct{} {
+		return dataChanged
 	}
-	ms.DatabasesFn = func() ([]meta.DatabaseInfo, error) {
+	ms.DatabasesFn = func() []meta.DatabaseInfo {
 		return []meta.DatabaseInfo{
 			{
 				Name: "db0",
@@ -295,14 +291,14 @@ func TestService_Multiple(t *testing.T) {
 					},
 				},
 			},
-		}, nil
+		}
 	}
 
-	prs := make(chan *cluster.WritePointsRequest, 4)
+	prs := make(chan *coordinator.WritePointsRequest, 4)
 	urls := make(chan url.URL, 4)
 	newPointsWriter := func(u url.URL) (subscriber.PointsWriter, error) {
 		sub := Subscription{}
-		sub.WritePointsFn = func(p *cluster.WritePointsRequest) error {
+		sub.WritePointsFn = func(p *coordinator.WritePointsRequest) error {
 			prs <- p
 			return nil
 		}
@@ -311,13 +307,13 @@ func TestService_Multiple(t *testing.T) {
 	}
 
 	s := subscriber.NewService(subscriber.NewConfig())
-	s.MetaStore = ms
+	s.MetaClient = ms
 	s.NewPointsWriter = newPointsWriter
 	s.Open()
 	defer s.Close()
 
 	// Signal that data has changed
-	dataChanged <- true
+	dataChanged <- struct{}{}
 
 	for _, expURLStr := range []string{"udp://h0:9093", "udp://h1:9093", "udp://h2:9093", "udp://h3:9093"} {
 		var u url.URL
@@ -333,24 +329,24 @@ func TestService_Multiple(t *testing.T) {
 	}
 
 	// Write points that don't match any subscription.
-	s.Points() <- &cluster.WritePointsRequest{
+	s.Points() <- &coordinator.WritePointsRequest{
 		Database:        "db1",
 		RetentionPolicy: "rp0",
 	}
-	s.Points() <- &cluster.WritePointsRequest{
+	s.Points() <- &coordinator.WritePointsRequest{
 		Database:        "db0",
 		RetentionPolicy: "rp2",
 	}
 
 	// Write points that match subscription with mode ANY
-	expPR := &cluster.WritePointsRequest{
+	expPR := &coordinator.WritePointsRequest{
 		Database:        "db0",
 		RetentionPolicy: "rp0",
 	}
 	s.Points() <- expPR
 
 	// Validate we get the pr back just once
-	var pr *cluster.WritePointsRequest
+	var pr *coordinator.WritePointsRequest
 	select {
 	case pr = <-prs:
 	case <-time.After(10 * time.Millisecond):
@@ -368,7 +364,7 @@ func TestService_Multiple(t *testing.T) {
 	}
 
 	// Write points that match subscription with mode ALL
-	expPR = &cluster.WritePointsRequest{
+	expPR = &coordinator.WritePointsRequest{
 		Database:        "db0",
 		RetentionPolicy: "rp1",
 	}
@@ -389,20 +385,19 @@ func TestService_Multiple(t *testing.T) {
 }
 
 func TestService_WaitForDataChanged(t *testing.T) {
-	dataChanged := make(chan bool)
-	ms := MetaStore{}
-	ms.WaitForDataChangedFn = func() error {
-		<-dataChanged
-		return nil
+	dataChanged := make(chan struct{}, 1)
+	ms := MetaClient{}
+	ms.WaitForDataChangedFn = func() chan struct{} {
+		return dataChanged
 	}
 	calls := make(chan bool, 2)
-	ms.DatabasesFn = func() ([]meta.DatabaseInfo, error) {
+	ms.DatabasesFn = func() []meta.DatabaseInfo {
 		calls <- true
-		return nil, nil
+		return nil
 	}
 
 	s := subscriber.NewService(subscriber.NewConfig())
-	s.MetaStore = ms
+	s.MetaClient = ms
 	// Explicitly closed below for testing
 	s.Open()
 
@@ -420,7 +415,7 @@ func TestService_WaitForDataChanged(t *testing.T) {
 	}
 
 	// Signal that data has changed
-	dataChanged <- true
+	dataChanged <- struct{}{}
 
 	// Should be called once more after data changed
 	select {
@@ -437,7 +432,7 @@ func TestService_WaitForDataChanged(t *testing.T) {
 
 	//Close service ensure not called
 	s.Close()
-	dataChanged <- true
+	dataChanged <- struct{}{}
 	select {
 	case <-calls:
 		t.Fatal("unexpected call")

@@ -1,8 +1,9 @@
-package collectd
+package collectd // import "github.com/influxdata/influxdb/services/collectd"
 
 import (
 	"expvar"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -10,15 +11,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/influxdb/influxdb"
-	"github.com/influxdb/influxdb/cluster"
-	"github.com/influxdb/influxdb/meta"
-	"github.com/influxdb/influxdb/models"
-	"github.com/influxdb/influxdb/tsdb"
+	"github.com/influxdata/influxdb"
+	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/services/meta"
+	"github.com/influxdata/influxdb/tsdb"
 	"github.com/kimor79/gollectd"
 )
-
-const leaderWaitTimeout = 30 * time.Second
 
 // statistics gathered by the collectd service.
 const (
@@ -34,20 +32,19 @@ const (
 
 // pointsWriter is an internal interface to make testing easier.
 type pointsWriter interface {
-	WritePoints(p *cluster.WritePointsRequest) error
+	WritePoints(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, points []models.Point) error
 }
 
 // metaStore is an internal interface to make testing easier.
-type metaStore interface {
-	WaitForLeader(d time.Duration) error
-	CreateDatabaseIfNotExists(name string) (*meta.DatabaseInfo, error)
+type metaClient interface {
+	CreateDatabase(name string) (*meta.DatabaseInfo, error)
 }
 
 // Service represents a UDP server which receives metrics in collectd's binary
 // protocol and stores them in InfluxDB.
 type Service struct {
 	Config       *Config
-	MetaStore    metaStore
+	MetaClient   metaClient
 	PointsWriter pointsWriter
 	Logger       *log.Logger
 
@@ -65,13 +62,15 @@ type Service struct {
 
 // NewService returns a new instance of the collectd service.
 func NewService(c Config) *Service {
-	s := &Service{
-		Config: &c,
+	s := Service{
+		// Use defaults where necessary.
+		Config: c.WithDefaults(),
+
 		Logger: log.New(os.Stderr, "[collectd] ", log.LstdFlags),
 		err:    make(chan error),
 	}
 
-	return s
+	return &s
 }
 
 // Open starts the service.
@@ -92,12 +91,7 @@ func (s *Service) Open() error {
 		return fmt.Errorf("PointsWriter is nil")
 	}
 
-	if err := s.MetaStore.WaitForLeader(leaderWaitTimeout); err != nil {
-		s.Logger.Printf("Failed to detect a cluster leader: %s", err.Error())
-		return err
-	}
-
-	if _, err := s.MetaStore.CreateDatabaseIfNotExists(s.Config.Database); err != nil {
+	if _, err := s.MetaClient.CreateDatabase(s.Config.Database); err != nil {
 		s.Logger.Printf("Failed to ensure target database %s exists: %s", s.Config.Database, err.Error())
 		return err
 	}
@@ -172,9 +166,10 @@ func (s *Service) Close() error {
 	return nil
 }
 
-// SetLogger sets the internal logger to the logger passed in.
-func (s *Service) SetLogger(l *log.Logger) {
-	s.Logger = l
+// SetLogOutput sets the writer to which all logs are written. It must not be
+// called after Open is called.
+func (s *Service) SetLogOutput(w io.Writer) {
+	s.Logger = log.New(w, "[collectd] ", log.LstdFlags)
 }
 
 // SetTypes sets collectd types db.
@@ -250,12 +245,7 @@ func (s *Service) writePoints() {
 		case <-s.stop:
 			return
 		case batch := <-s.batcher.Out():
-			if err := s.PointsWriter.WritePoints(&cluster.WritePointsRequest{
-				Database:         s.Config.Database,
-				RetentionPolicy:  s.Config.RetentionPolicy,
-				ConsistencyLevel: cluster.ConsistencyLevelAny,
-				Points:           batch,
-			}); err == nil {
+			if err := s.PointsWriter.WritePoints(s.Config.Database, s.Config.RetentionPolicy, models.ConsistencyLevelAny, batch); err == nil {
 				s.statMap.Add(statBatchesTrasmitted, 1)
 				s.statMap.Add(statPointsTransmitted, int64(len(batch)))
 			} else {
@@ -305,7 +295,7 @@ func (s *Service) UnmarshalCollectd(packet *gollectd.Packet) []models.Point {
 		p, err := models.NewPoint(name, tags, fields, timestamp)
 		// Drop invalid points
 		if err != nil {
-			s.Logger.Printf("Dropping point %v: %v", p.Name, err)
+			s.Logger.Printf("Dropping point %v: %v", name, err)
 			s.statMap.Add(statDroppedPointsInvalid, 1)
 			continue
 		}
@@ -313,11 +303,4 @@ func (s *Service) UnmarshalCollectd(packet *gollectd.Packet) []models.Point {
 		points = append(points, p)
 	}
 	return points
-}
-
-// assert will panic with a given formatted message if the given condition is false.
-func assert(condition bool, msg string, v ...interface{}) {
-	if !condition {
-		panic(fmt.Sprintf("assert failed: "+msg, v...))
-	}
 }

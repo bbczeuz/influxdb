@@ -10,10 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
-	"strings"
 	"time"
-
-	"github.com/BurntSushi/toml"
 )
 
 const logo = `
@@ -67,12 +64,16 @@ func (cmd *Command) Run(args ...string) error {
 	// Print sweet InfluxDB logo.
 	fmt.Print(logo)
 
+	// Configure default logging.
+	log.SetPrefix("[run] ")
+	log.SetFlags(log.LstdFlags)
+
 	// Set parallelism.
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	// Mark start-up in log.
-	log.Printf("InfluxDB starting, version %s, branch %s, commit %s, built %s",
-		cmd.Version, cmd.Branch, cmd.Commit, cmd.BuildTime)
+	log.Printf("InfluxDB starting, version %s, branch %s, commit %s",
+		cmd.Version, cmd.Branch, cmd.Commit)
 	log.Printf("Go version %s, GOMAXPROCS set to %d", runtime.Version(), runtime.GOMAXPROCS(0))
 
 	// Write the PID file.
@@ -84,7 +85,7 @@ func (cmd *Command) Run(args ...string) error {
 	runtime.SetBlockProfileRate(int(1 * time.Second))
 
 	// Parse config
-	config, err := cmd.ParseConfig(options.ConfigPath)
+	config, err := cmd.ParseConfig(options.GetConfigPath())
 	if err != nil {
 		return fmt.Errorf("parse config: %s", err)
 	}
@@ -94,13 +95,8 @@ func (cmd *Command) Run(args ...string) error {
 		return fmt.Errorf("apply env config: %v", err)
 	}
 
-	// Override config hostname if specified in the command line args.
 	if options.Hostname != "" {
-		config.Meta.Hostname = options.Hostname
-	}
-
-	if options.Join != "" {
-		config.Meta.Peers = strings.Split(options.Join, ",")
+		config.Hostname = options.Hostname
 	}
 
 	// Validate the configuration.
@@ -161,7 +157,6 @@ func (cmd *Command) ParseFlags(args ...string) (Options, error) {
 	fs.StringVar(&options.ConfigPath, "config", "", "")
 	fs.StringVar(&options.PIDFile, "pidfile", "", "")
 	fs.StringVar(&options.Hostname, "hostname", "", "")
-	fs.StringVar(&options.Join, "join", "", "")
 	fs.StringVar(&options.CPUProfile, "cpuprofile", "", "")
 	fs.StringVar(&options.MemProfile, "memprofile", "", "")
 	fs.Usage = func() { fmt.Fprintln(cmd.Stderr, usage) }
@@ -205,7 +200,7 @@ func (cmd *Command) ParseConfig(path string) (*Config, error) {
 	log.Printf("Using configuration at: %s\n", path)
 
 	config := NewConfig()
-	if _, err := toml.DecodeFile(path, &config); err != nil {
+	if err := config.FromTomlFile(path); err != nil {
 		return nil, err
 	}
 
@@ -214,9 +209,8 @@ func (cmd *Command) ParseConfig(path string) (*Config, error) {
 
 var usage = `usage: run [flags]
 
-run starts the broker and data node server. If this is the first time running
-the command then a new cluster will be initialized unless the -join argument
-is used.
+run starts the InfluxDB server. If this is the first time running the command
+then a new cluster will be initialized unless the -join argument is used.
 
         -config <path>
                           Set the path to the configuration file.
@@ -225,11 +219,14 @@ is used.
                           Override the hostname, the 'hostname' configuration
                           option will be overridden.
 
-        -join <url>
-                          Joins the server to an existing cluster.
-
         -pidfile <path>
                           Write process ID to a file.
+
+        -cpuprofile <path>
+                          Write CPU profiling information to a file.
+
+        -memprofile <path>
+                          Write memory usage information to a file.
 `
 
 // Options represents the command line options that can be parsed.
@@ -237,7 +234,31 @@ type Options struct {
 	ConfigPath string
 	PIDFile    string
 	Hostname   string
-	Join       string
 	CPUProfile string
 	MemProfile string
+}
+
+// GetConfigPath returns the config path from the options.
+// It will return a path by searching in this order:
+//   1. The CLI option in ConfigPath
+//   2. The environment variable INFLUXDB_CONFIG_PATH
+//   3. The first influxdb.conf file on the path:
+//        - ~/.influxdb
+//        - /etc/influxdb
+func (opt *Options) GetConfigPath() string {
+	if opt.ConfigPath != "" {
+		return opt.ConfigPath
+	} else if envVar := os.Getenv("INFLUXDB_CONFIG_PATH"); envVar != "" {
+		return envVar
+	}
+
+	for _, path := range []string{
+		os.ExpandEnv("${HOME}/.influxdb/influxdb.conf"),
+		"/etc/influxdb/influxdb.conf",
+	} {
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+	return ""
 }

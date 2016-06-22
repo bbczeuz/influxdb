@@ -1,4 +1,4 @@
-package tcp
+package tcp // import "github.com/influxdata/influxdb/tcp"
 
 import (
 	"errors"
@@ -18,8 +18,11 @@ const (
 
 // Mux multiplexes a network connection.
 type Mux struct {
+	mu sync.RWMutex
 	ln net.Listener
 	m  map[byte]*listener
+
+	defaultListener *listener
 
 	wg sync.WaitGroup
 
@@ -28,6 +31,26 @@ type Mux struct {
 
 	// Out-of-band error logger
 	Logger *log.Logger
+}
+
+type replayConn struct {
+	net.Conn
+	firstByte     byte
+	readFirstbyte bool
+}
+
+func (rc *replayConn) Read(b []byte) (int, error) {
+	if rc.readFirstbyte {
+		return rc.Conn.Read(b)
+	}
+
+	if len(b) == 0 {
+		return 0, nil
+	}
+
+	b[0] = rc.firstByte
+	rc.readFirstbyte = true
+	return 1, nil
 }
 
 // NewMux returns a new instance of Mux for ln.
@@ -41,6 +64,9 @@ func NewMux() *Mux {
 
 // Serve handles connections from ln and multiplexes then across registered listener.
 func (mux *Mux) Serve(ln net.Listener) error {
+	mux.mu.Lock()
+	mux.ln = ln
+	mux.mu.Unlock()
 	for {
 		// Wait for the next connection.
 		// If it returns a temporary error then simply retry.
@@ -57,6 +83,11 @@ func (mux *Mux) Serve(ln net.Listener) error {
 			for _, ln := range mux.m {
 				close(ln.c)
 			}
+
+			if mux.defaultListener != nil {
+				close(mux.defaultListener.c)
+			}
+
 			return err
 		}
 
@@ -93,13 +124,30 @@ func (mux *Mux) handleConn(conn net.Conn) {
 	// Retrieve handler based on first byte.
 	handler := mux.m[typ[0]]
 	if handler == nil {
-		conn.Close()
-		mux.Logger.Printf("tcp.Mux: handler not registered: %d", typ[0])
-		return
+		if mux.defaultListener == nil {
+			conn.Close()
+			mux.Logger.Printf("tcp.Mux: handler not registered: %d. Connection from %s closed", typ[0], conn.RemoteAddr())
+			return
+		}
+
+		conn = &replayConn{
+			Conn:      conn,
+			firstByte: typ[0],
+		}
+		handler = mux.defaultListener
 	}
 
 	// Send connection to handler.  The handler is responsible for closing the connection.
-	handler.c <- conn
+	timer := time.NewTimer(mux.Timeout)
+	defer timer.Stop()
+
+	select {
+	case handler.c <- conn:
+	case <-timer.C:
+		conn.Close()
+		mux.Logger.Printf("tcp.Mux: handler not ready: %d. Connection from %s closed", typ[0], conn.RemoteAddr())
+		return
+	}
 }
 
 // Listen returns a listener identified by header.
@@ -112,16 +160,37 @@ func (mux *Mux) Listen(header byte) net.Listener {
 
 	// Create a new listener and assign it.
 	ln := &listener{
-		c: make(chan net.Conn),
+		c:   make(chan net.Conn),
+		mux: mux,
 	}
 	mux.m[header] = ln
 
 	return ln
 }
 
+// DefaultListener() will return a net.Listener that will pass-through any
+// connections with non-registered values for the first byte of the connection.
+// The connections returned from this listener's Accept() method will replay the
+// first byte of the connection as a short first Read().
+//
+// This can be used to pass to an HTTP server, so long as there are no conflicts
+// with registsered listener bytes and the first character of the HTTP request:
+// 71 ('G') for GET, etc.
+func (mux *Mux) DefaultListener() net.Listener {
+	if mux.defaultListener == nil {
+		mux.defaultListener = &listener{
+			c:   make(chan net.Conn),
+			mux: mux,
+		}
+	}
+
+	return mux.defaultListener
+}
+
 // listener is a receiver for connections received by Mux.
 type listener struct {
-	c chan net.Conn
+	c   chan net.Conn
+	mux *Mux
 }
 
 // Accept waits for and returns the next connection to the listener.
@@ -136,8 +205,21 @@ func (ln *listener) Accept() (c net.Conn, err error) {
 // Close is a no-op. The mux's listener should be closed instead.
 func (ln *listener) Close() error { return nil }
 
-// Addr always returns nil.
-func (ln *listener) Addr() net.Addr { return nil }
+// Addr returns the Addr of the listener
+func (ln *listener) Addr() net.Addr {
+	if ln.mux == nil {
+		return nil
+	}
+
+	ln.mux.mu.RLock()
+	defer ln.mux.mu.RUnlock()
+
+	if ln.mux.ln == nil {
+		return nil
+	}
+
+	return ln.mux.ln.Addr()
+}
 
 // Dial connects to a remote mux listener with a given header byte.
 func Dial(network, address string, header byte) (net.Conn, error) {

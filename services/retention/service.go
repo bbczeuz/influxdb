@@ -1,19 +1,19 @@
-package retention
+package retention // import "github.com/influxdata/influxdb/services/retention"
 
 import (
+	"io"
 	"log"
 	"os"
 	"sync"
 	"time"
 
-	"github.com/influxdb/influxdb/meta"
+	"github.com/influxdata/influxdb/services/meta"
 )
 
 // Service represents the retention policy enforcement service.
 type Service struct {
-	MetaStore interface {
-		IsLeader() bool
-		VisitRetentionPolicies(f func(d meta.DatabaseInfo, r meta.RetentionPolicyInfo))
+	MetaClient interface {
+		Databases() []meta.DatabaseInfo
 		DeleteShardGroup(database, policy string, id uint64) error
 	}
 	TSDBStore interface {
@@ -55,9 +55,10 @@ func (s *Service) Close() error {
 	return nil
 }
 
-// SetLogger sets the internal logger to the logger passed in.
-func (s *Service) SetLogger(l *log.Logger) {
-	s.logger = l
+// SetLogOutput sets the writer to which all logs are written. It must not be
+// called after Open is called.
+func (s *Service) SetLogOutput(w io.Writer) {
+	s.logger = log.New(w, "[retention] ", log.LstdFlags)
 }
 
 func (s *Service) deleteShardGroups() {
@@ -71,24 +72,20 @@ func (s *Service) deleteShardGroups() {
 			return
 
 		case <-ticker.C:
-			// Only run this on the leader, but always allow the loop to check
-			// as the leader can change.
-			if !s.MetaStore.IsLeader() {
-				continue
-			}
-			s.logger.Println("retention policy enforcement check commencing")
-
-			s.MetaStore.VisitRetentionPolicies(func(d meta.DatabaseInfo, r meta.RetentionPolicyInfo) {
-				for _, g := range r.ExpiredShardGroups(time.Now().UTC()) {
-					if err := s.MetaStore.DeleteShardGroup(d.Name, r.Name, g.ID); err != nil {
-						s.logger.Printf("failed to delete shard group %d from database %s, retention policy %s: %s",
-							g.ID, d.Name, r.Name, err.Error())
-					} else {
-						s.logger.Printf("deleted shard group %d from database %s, retention policy %s",
-							g.ID, d.Name, r.Name)
+			dbs := s.MetaClient.Databases()
+			for _, d := range dbs {
+				for _, r := range d.RetentionPolicies {
+					for _, g := range r.ExpiredShardGroups(time.Now().UTC()) {
+						if err := s.MetaClient.DeleteShardGroup(d.Name, r.Name, g.ID); err != nil {
+							s.logger.Printf("failed to delete shard group %d from database %s, retention policy %s: %s",
+								g.ID, d.Name, r.Name, err.Error())
+						} else {
+							s.logger.Printf("deleted shard group %d from database %s, retention policy %s",
+								g.ID, d.Name, r.Name)
+						}
 					}
 				}
-			})
+			}
 		}
 	}
 }
@@ -111,13 +108,16 @@ func (s *Service) deleteShards() {
 				rp string
 			}
 			deletedShardIDs := make(map[uint64]deletionInfo, 0)
-			s.MetaStore.VisitRetentionPolicies(func(d meta.DatabaseInfo, r meta.RetentionPolicyInfo) {
-				for _, g := range r.DeletedShardGroups() {
-					for _, sh := range g.Shards {
-						deletedShardIDs[sh.ID] = deletionInfo{db: d.Name, rp: r.Name}
+			dbs := s.MetaClient.Databases()
+			for _, d := range dbs {
+				for _, r := range d.RetentionPolicies {
+					for _, g := range r.DeletedShardGroups() {
+						for _, sh := range g.Shards {
+							deletedShardIDs[sh.ID] = deletionInfo{db: d.Name, rp: r.Name}
+						}
 					}
 				}
-			})
+			}
 
 			for _, id := range s.TSDBStore.ShardIDs() {
 				if di, ok := deletedShardIDs[id]; ok {

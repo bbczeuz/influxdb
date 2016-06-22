@@ -1,57 +1,74 @@
 package run
 
 import (
-	"errors"
 	"fmt"
+	"io/ioutil"
+	"log"
 	"os"
 	"os/user"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/influxdb/influxdb/cluster"
-	"github.com/influxdb/influxdb/meta"
-	"github.com/influxdb/influxdb/monitor"
-	"github.com/influxdb/influxdb/services/admin"
-	"github.com/influxdb/influxdb/services/collectd"
-	"github.com/influxdb/influxdb/services/continuous_querier"
-	"github.com/influxdb/influxdb/services/graphite"
-	"github.com/influxdb/influxdb/services/hh"
-	"github.com/influxdb/influxdb/services/httpd"
-	"github.com/influxdb/influxdb/services/opentsdb"
-	"github.com/influxdb/influxdb/services/precreator"
-	"github.com/influxdb/influxdb/services/retention"
-	"github.com/influxdb/influxdb/services/subscriber"
-	"github.com/influxdb/influxdb/services/udp"
-	"github.com/influxdb/influxdb/tsdb"
+	"github.com/BurntSushi/toml"
+	"github.com/influxdata/influxdb/coordinator"
+	"github.com/influxdata/influxdb/monitor"
+	"github.com/influxdata/influxdb/services/admin"
+	"github.com/influxdata/influxdb/services/collectd"
+	"github.com/influxdata/influxdb/services/continuous_querier"
+	"github.com/influxdata/influxdb/services/graphite"
+	"github.com/influxdata/influxdb/services/httpd"
+	"github.com/influxdata/influxdb/services/meta"
+	"github.com/influxdata/influxdb/services/opentsdb"
+	"github.com/influxdata/influxdb/services/precreator"
+	"github.com/influxdata/influxdb/services/retention"
+	"github.com/influxdata/influxdb/services/subscriber"
+	"github.com/influxdata/influxdb/services/udp"
+	"github.com/influxdata/influxdb/tsdb"
+)
+
+const (
+	// DefaultBindAddress is the default address for raft, cluster, snapshot, etc..
+	DefaultBindAddress = ":8088"
+
+	// DefaultHostname is the default hostname used if we are unable to determine
+	// the hostname from the system
+	DefaultHostname = "localhost"
 )
 
 // Config represents the configuration format for the influxd binary.
 type Config struct {
-	Meta       *meta.Config      `toml:"meta"`
-	Data       tsdb.Config       `toml:"data"`
-	Cluster    cluster.Config    `toml:"cluster"`
-	Retention  retention.Config  `toml:"retention"`
-	Precreator precreator.Config `toml:"shard-precreation"`
+	Meta        *meta.Config       `toml:"meta"`
+	Data        tsdb.Config        `toml:"data"`
+	Coordinator coordinator.Config `toml:"coordinator"`
+	Retention   retention.Config   `toml:"retention"`
+	Precreator  precreator.Config  `toml:"shard-precreation"`
 
-	Admin      admin.Config      `toml:"admin"`
-	Monitor    monitor.Config    `toml:"monitor"`
-	Subscriber subscriber.Config `toml:"subscriber"`
-	HTTPD      httpd.Config      `toml:"http"`
-	Graphites  []graphite.Config `toml:"graphite"`
-	Collectd   collectd.Config   `toml:"collectd"`
-	OpenTSDB   opentsdb.Config   `toml:"opentsdb"`
-	UDPs       []udp.Config      `toml:"udp"`
+	Admin          admin.Config      `toml:"admin"`
+	Monitor        monitor.Config    `toml:"monitor"`
+	Subscriber     subscriber.Config `toml:"subscriber"`
+	HTTPD          httpd.Config      `toml:"http"`
+	GraphiteInputs []graphite.Config `toml:"graphite"`
+	CollectdInputs []collectd.Config `toml:"collectd"`
+	OpenTSDBInputs []opentsdb.Config `toml:"opentsdb"`
+	UDPInputs      []udp.Config      `toml:"udp"`
 
-	// Snapshot SnapshotConfig `toml:"snapshot"`
 	ContinuousQuery continuous_querier.Config `toml:"continuous_queries"`
-
-	HintedHandoff hh.Config `toml:"hinted-handoff"`
 
 	// Server reporting
 	ReportingDisabled bool `toml:"reporting-disabled"`
+
+	// BindAddress is the address that all TCP services use (Raft, Snapshot, Cluster, etc.)
+	BindAddress string `toml:"bind-address"`
+
+	// Hostname is the hostname portion to use when registering local
+	// addresses.  This hostname must be resolvable from other nodes.
+	Hostname string `toml:"hostname"`
+
+	Join string `toml:"join"`
 }
 
 // NewConfig returns an instance of Config with reasonable defaults.
@@ -59,19 +76,22 @@ func NewConfig() *Config {
 	c := &Config{}
 	c.Meta = meta.NewConfig()
 	c.Data = tsdb.NewConfig()
-	c.Cluster = cluster.NewConfig()
+	c.Coordinator = coordinator.NewConfig()
 	c.Precreator = precreator.NewConfig()
 
 	c.Admin = admin.NewConfig()
 	c.Monitor = monitor.NewConfig()
 	c.Subscriber = subscriber.NewConfig()
 	c.HTTPD = httpd.NewConfig()
-	c.Collectd = collectd.NewConfig()
-	c.OpenTSDB = opentsdb.NewConfig()
+
+	c.GraphiteInputs = []graphite.Config{graphite.NewConfig()}
+	c.CollectdInputs = []collectd.Config{collectd.NewConfig()}
+	c.OpenTSDBInputs = []opentsdb.Config{opentsdb.NewConfig()}
+	c.UDPInputs = []udp.Config{udp.NewConfig()}
 
 	c.ContinuousQuery = continuous_querier.NewConfig()
 	c.Retention = retention.NewConfig()
-	c.HintedHandoff = hh.NewConfig()
+	c.BindAddress = DefaultBindAddress
 
 	return c
 }
@@ -93,32 +113,61 @@ func NewDemoConfig() (*Config, error) {
 
 	c.Meta.Dir = filepath.Join(homeDir, ".influxdb/meta")
 	c.Data.Dir = filepath.Join(homeDir, ".influxdb/data")
-	c.HintedHandoff.Dir = filepath.Join(homeDir, ".influxdb/hh")
 	c.Data.WALDir = filepath.Join(homeDir, ".influxdb/wal")
 
-	c.HintedHandoff.Enabled = true
 	c.Admin.Enabled = true
 
 	return c, nil
 }
 
+// FromTomlFile loads the config from a TOML file.
+func (c *Config) FromTomlFile(fpath string) error {
+	bs, err := ioutil.ReadFile(fpath)
+	if err != nil {
+		return err
+	}
+	return c.FromToml(string(bs))
+}
+
+// FromToml loads the config from TOML.
+func (c *Config) FromToml(input string) error {
+	// Replace deprecated [cluster] with [coordinator]
+	re := regexp.MustCompile(`(?m)^\s*\[cluster\]`)
+	input = re.ReplaceAllStringFunc(input, func(in string) string {
+		in = strings.TrimSpace(in)
+		out := "[coordinator]"
+		log.Printf("deprecated config option %s replaced with %s; %s will not be supported in a future release\n", in, out, in)
+		return out
+	})
+
+	_, err := toml.Decode(input, c)
+	return err
+}
+
 // Validate returns an error if the config is invalid.
 func (c *Config) Validate() error {
-	if c.Meta.Dir == "" {
-		return errors.New("Meta.Dir must be specified")
-	} else if c.HintedHandoff.Enabled && c.HintedHandoff.Dir == "" {
-		return errors.New("HintedHandoff.Dir must be specified")
+	if err := c.Meta.Validate(); err != nil {
+		return err
 	}
 
 	if err := c.Data.Validate(); err != nil {
 		return err
 	}
 
-	for _, g := range c.Graphites {
+	if err := c.Monitor.Validate(); err != nil {
+		return err
+	}
+
+	if err := c.Subscriber.Validate(); err != nil {
+		return err
+	}
+
+	for _, g := range c.GraphiteInputs {
 		if err := g.Validate(); err != nil {
 			return fmt.Errorf("invalid graphite config: %v", err)
 		}
 	}
+
 	return nil
 }
 
@@ -162,6 +211,9 @@ func (c *Config) applyEnvOverrides(prefix string, spec reflect.Value) error {
 			// e.g. GRAPHITE_0
 			if f.Kind() == reflect.Slice || f.Kind() == reflect.Array {
 				for i := 0; i < f.Len(); i++ {
+					if err := c.applyEnvOverrides(key, f.Index(i)); err != nil {
+						return err
+					}
 					if err := c.applyEnvOverrides(fmt.Sprintf("%s_%d", key, i), f.Index(i)); err != nil {
 						return err
 					}
@@ -205,6 +257,15 @@ func (c *Config) applyEnvOverrides(prefix string, spec reflect.Value) error {
 				}
 
 				f.SetInt(intValue)
+			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+				var intValue uint64
+				var err error
+				intValue, err = strconv.ParseUint(value, 0, f.Type().Bits())
+				if err != nil {
+					return fmt.Errorf("failed to apply %v to %v using type %v and value '%v'", key, fieldKey, f.Type().String(), value)
+				}
+
+				f.SetUint(intValue)
 			case reflect.Bool:
 				boolValue, err := strconv.ParseBool(value)
 				if err != nil {
